@@ -5,7 +5,14 @@ use std::io::Write;
 #[cfg(feature = "native-mlx")]
 use std::path::{Path, PathBuf};
 #[cfg(feature = "native-mlx")]
-use std::sync::Once;
+use std::sync::{
+    Arc, Once,
+    atomic::{AtomicBool, Ordering},
+};
+#[cfg(feature = "native-mlx")]
+use std::thread::{self, JoinHandle};
+#[cfg(feature = "native-mlx")]
+use std::time::Duration;
 use std::time::Instant;
 
 use anyhow::Result;
@@ -19,6 +26,8 @@ const DEFAULT_MAX_KV_CONTEXT_TOKENS: usize = 16_384;
 const DEFAULT_MLX_CACHE_LIMIT_BYTES: usize = 512 * 1024 * 1024;
 #[cfg(feature = "native-mlx")]
 const DEFAULT_MLX_MEMORY_LIMIT_BYTES: usize = 8 * 1024 * 1024 * 1024;
+#[cfg(feature = "native-mlx")]
+const DEFAULT_RSS_KILL_PERCENT: u64 = 50;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct InferenceRequest {
@@ -173,6 +182,13 @@ struct MemorySnapshot {
 struct RequestMemoryGuard {
     enabled: bool,
     request_label: &'static str,
+    watchdog: Option<RequestWatchdog>,
+}
+
+#[cfg(feature = "native-mlx")]
+struct RequestWatchdog {
+    alive: Arc<AtomicBool>,
+    handle: Option<JoinHandle<()>>,
 }
 
 #[cfg(feature = "native-mlx")]
@@ -186,6 +202,7 @@ impl RequestMemoryGuard {
         Self {
             enabled,
             request_label,
+            watchdog: RequestWatchdog::start(request_label),
         }
     }
 }
@@ -193,9 +210,40 @@ impl RequestMemoryGuard {
 #[cfg(feature = "native-mlx")]
 impl Drop for RequestMemoryGuard {
     fn drop(&mut self) {
+        self.watchdog.take();
         clear_mlx_cache();
         if self.enabled {
             log_memory_sample(self.request_label, "drop_after_clear_cache", "");
+        }
+    }
+}
+
+#[cfg(feature = "native-mlx")]
+impl RequestWatchdog {
+    fn start(request_label: &'static str) -> Option<Self> {
+        if !env_flag("MTPLX_MEMORY_WATCHDOG", true) {
+            return None;
+        }
+        let alive = Arc::new(AtomicBool::new(true));
+        let thread_alive = Arc::clone(&alive);
+        let interval = memory_watchdog_interval();
+        let handle = thread::Builder::new()
+            .name("ferrite-memory-watchdog".to_string())
+            .spawn(move || memory_watchdog_loop(request_label, thread_alive, interval))
+            .ok()?;
+        Some(Self {
+            alive,
+            handle: Some(handle),
+        })
+    }
+}
+
+#[cfg(feature = "native-mlx")]
+impl Drop for RequestWatchdog {
+    fn drop(&mut self) {
+        self.alive.store(false, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
         }
     }
 }
@@ -453,6 +501,57 @@ fn check_kill_switch(phase: &str) -> Result<()> {
 }
 
 #[cfg(feature = "native-mlx")]
+fn memory_watchdog_loop(request_label: &'static str, alive: Arc<AtomicBool>, interval: Duration) {
+    while alive.load(Ordering::Relaxed) {
+        if kill_switch_path().exists() {
+            hard_exit_from_watchdog(request_label, "file", None, None);
+        }
+        if let Some(limit) = rss_kill_limit_bytes()
+            && let Some(rss) = process_rss_bytes()
+            && rss > limit
+        {
+            hard_exit_from_watchdog(request_label, "rss", Some(rss), Some(limit));
+        }
+        thread::sleep(interval);
+    }
+}
+
+#[cfg(feature = "native-mlx")]
+fn hard_exit_from_watchdog(
+    request_label: &'static str,
+    reason: &str,
+    rss_bytes: Option<u64>,
+    limit_bytes: Option<u64>,
+) -> ! {
+    let snapshot = memory_snapshot();
+    let line = format!(
+        "ferrite_memory request={request_label} phase=watchdog_hard_exit reason={reason} rss_bytes={} limit_bytes={} mlx_active_bytes={} mlx_cache_bytes={} mlx_peak_bytes={}",
+        rss_bytes
+            .or(snapshot.rss_bytes)
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "unknown".to_string()),
+        limit_bytes
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "unknown".to_string()),
+        optional_usize(snapshot.mlx_active_bytes),
+        optional_usize(snapshot.mlx_cache_bytes),
+        optional_usize(snapshot.mlx_peak_bytes),
+    );
+    let _ = append_memory_log_line(&line);
+    unsafe { libc::_exit(137) }
+}
+
+#[cfg(feature = "native-mlx")]
+fn memory_watchdog_interval() -> Duration {
+    let millis = ferrite_env_var("MTPLX_MEMORY_WATCHDOG_INTERVAL_MS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(250);
+    Duration::from_millis(millis)
+}
+
+#[cfg(feature = "native-mlx")]
 fn kill_switch_path() -> PathBuf {
     ferrite_env_var("MTPLX_KILL_SWITCH_FILE")
         .ok()
@@ -465,7 +564,8 @@ fn kill_switch_path() -> PathBuf {
 fn rss_kill_limit_bytes() -> Option<u64> {
     match ferrite_env_var("MTPLX_RSS_KILL_BYTES") {
         Ok(value) => value.trim().parse::<u64>().ok().filter(|value| *value > 0),
-        Err(_) => physical_memory_bytes().map(|bytes| bytes.saturating_mul(75) / 100),
+        Err(_) => physical_memory_bytes()
+            .map(|bytes| bytes.saturating_mul(DEFAULT_RSS_KILL_PERCENT) / 100),
     }
 }
 
@@ -1314,26 +1414,16 @@ fn prepare_prompt_state(
             };
             let suffix = &prompt_ids[cached_prompt_len..];
             if !suffix.is_empty() {
-                let base_hidden = hidden.clone();
-                let (suffix_logits, suffix_hidden) = session
-                    .qwen
-                    .decode_tokens_logits_with_hidden(suffix, &session.plan, &mut state)?;
-                let last = suffix.len() as i32 - 1;
-                logits = suffix_logits.index((.., last..last + 1, ..));
-                hidden = suffix_hidden.index((.., last..last + 1, ..));
-                if request.profile_timings {
-                    logits.eval()?;
-                    hidden.eval()?;
-                }
-                if needs_mtp_history {
-                    append_mtp_history_from_commit(
-                        session,
-                        &mut mtp_history_state,
-                        &base_hidden,
-                        suffix,
-                        &suffix_hidden,
-                    )?;
-                }
+                extend_prompt_state_chunked(
+                    session,
+                    request,
+                    suffix,
+                    &mut state,
+                    &mut logits,
+                    &mut hidden,
+                    &mut mtp_history_state,
+                    needs_mtp_history,
+                )?;
             }
             state.clear_transient_block_states();
             eval_prepared_prompt_state(&state, &logits, &hidden, &mtp_history_state)?;
@@ -1358,26 +1448,8 @@ fn prepare_prompt_state(
         }
     }
 
-    let prompt_i32 = prompt_ids.iter().map(|id| *id as i32).collect::<Vec<_>>();
-    let input_ids = mlx_rs::Array::from_slice(&prompt_i32, &[1, prompt_i32.len() as i32]);
-    let mut state = session.qwen.new_decode_state(&session.plan)?;
-    let (logits, hidden, prompt_hidden) = session.qwen.prefill_decode_state_with_hidden_sequence(
-        &input_ids,
-        &session.plan,
-        &mut state,
-    )?;
-    if request.profile_timings {
-        logits.eval()?;
-        hidden.eval()?;
-        prompt_hidden.eval()?;
-    }
-    let mtp_history_state = if needs_mtp_history {
-        seed_mtp_history_from_prompt(session, prompt_ids, &prompt_hidden)?
-    } else {
-        session.qwen.new_mtp_decode_state().unwrap_or_default()
-    };
-    state.clear_transient_block_states();
-    eval_prepared_prompt_state(&state, &logits, &hidden, &mtp_history_state)?;
+    let (state, logits, hidden, mtp_history_state) =
+        prepare_prompt_state_chunked(session, request, prompt_ids, needs_mtp_history)?;
     let prefill_s = started.elapsed().as_secs_f64();
     maybe_store_prompt_cache(
         session,
@@ -1396,6 +1468,148 @@ fn prepare_prompt_state(
         prefix_cache_hit: false,
         prefix_cache_tokens: 0,
     })
+}
+
+#[cfg(feature = "native-mlx")]
+fn prepare_prompt_state_chunked(
+    session: &NativeMlxSession,
+    request: &InferenceRequest,
+    prompt_ids: &[u32],
+    needs_mtp_history: bool,
+) -> Result<(
+    crate::qwen36::DecodeState,
+    mlx_rs::Array,
+    mlx_rs::Array,
+    crate::qwen36::MtpDecodeState,
+)> {
+    let _ = request;
+    if prompt_ids.is_empty() {
+        anyhow::bail!("prompt token list cannot be empty");
+    }
+
+    let mut state = session.qwen.new_decode_state(&session.plan)?;
+    let mut logits: Option<mlx_rs::Array> = None;
+    let mut hidden: Option<mlx_rs::Array> = None;
+    let mut mtp_history_state = if needs_mtp_history {
+        session.qwen.new_mtp_decode_state()?
+    } else {
+        session.qwen.new_mtp_decode_state().unwrap_or_default()
+    };
+
+    let chunk_tokens = prefill_chunk_tokens();
+    for (chunk_index, chunk) in prompt_ids.chunks(chunk_tokens).enumerate() {
+        check_kill_switch("prefill_chunk_before")?;
+        let previous_hidden = hidden.clone();
+        let chunk_hidden = session
+            .qwen
+            .decode_tokens_hidden(chunk, &session.plan, &mut state)?;
+        chunk_hidden.eval()?;
+        state.clear_transient_block_states();
+
+        if needs_mtp_history {
+            if let Some(previous_hidden) = previous_hidden {
+                append_mtp_history_from_commit(
+                    session,
+                    &mut mtp_history_state,
+                    &previous_hidden,
+                    chunk,
+                    &chunk_hidden,
+                )?;
+            } else {
+                mtp_history_state = seed_mtp_history_from_prompt(session, chunk, &chunk_hidden)?;
+            }
+            eval_mtp_decode_state(&mtp_history_state)?;
+        }
+
+        let last = chunk.len() as i32 - 1;
+        let last_hidden = chunk_hidden.index((.., last..last + 1, ..));
+        let last_logits = session.qwen.logits_from_hidden(&last_hidden)?;
+        last_hidden.eval()?;
+        last_logits.eval()?;
+        eval_decode_state(&state)?;
+        clear_mlx_cache();
+
+        if memory_trace_enabled() {
+            log_memory_sample(
+                "infer",
+                "prefill_chunk",
+                &format!(
+                    "chunk_index={chunk_index} chunk_tokens={} position={}",
+                    chunk.len(),
+                    state.position
+                ),
+            );
+        }
+        check_kill_switch("prefill_chunk_after")?;
+
+        logits = Some(last_logits);
+        hidden = Some(last_hidden);
+    }
+
+    let logits = logits.expect("non-empty prompt produces logits");
+    let hidden = hidden.expect("non-empty prompt produces hidden state");
+    state.clear_transient_block_states();
+    eval_prepared_prompt_state(&state, &logits, &hidden, &mtp_history_state)?;
+    Ok((state, logits, hidden, mtp_history_state))
+}
+
+#[cfg(feature = "native-mlx")]
+fn extend_prompt_state_chunked(
+    session: &NativeMlxSession,
+    request: &InferenceRequest,
+    suffix: &[u32],
+    state: &mut crate::qwen36::DecodeState,
+    logits: &mut mlx_rs::Array,
+    hidden: &mut mlx_rs::Array,
+    mtp_history_state: &mut crate::qwen36::MtpDecodeState,
+    needs_mtp_history: bool,
+) -> Result<()> {
+    let _ = request;
+    for (chunk_index, chunk) in suffix.chunks(prefill_chunk_tokens()).enumerate() {
+        check_kill_switch("prefill_suffix_chunk_before")?;
+        let previous_hidden = hidden.clone();
+        let chunk_hidden = session
+            .qwen
+            .decode_tokens_hidden(chunk, &session.plan, state)?;
+        chunk_hidden.eval()?;
+        state.clear_transient_block_states();
+
+        if needs_mtp_history {
+            append_mtp_history_from_commit(
+                session,
+                mtp_history_state,
+                &previous_hidden,
+                chunk,
+                &chunk_hidden,
+            )?;
+            eval_mtp_decode_state(mtp_history_state)?;
+        }
+
+        let last = chunk.len() as i32 - 1;
+        let last_hidden = chunk_hidden.index((.., last..last + 1, ..));
+        let last_logits = session.qwen.logits_from_hidden(&last_hidden)?;
+        last_hidden.eval()?;
+        last_logits.eval()?;
+        eval_decode_state(state)?;
+        clear_mlx_cache();
+
+        if memory_trace_enabled() {
+            log_memory_sample(
+                "infer",
+                "prefill_suffix_chunk",
+                &format!(
+                    "chunk_index={chunk_index} chunk_tokens={} position={}",
+                    chunk.len(),
+                    state.position
+                ),
+            );
+        }
+        check_kill_switch("prefill_suffix_chunk_after")?;
+
+        *logits = last_logits;
+        *hidden = last_hidden;
+    }
+    Ok(())
 }
 
 #[cfg(feature = "native-mlx")]
@@ -1743,27 +1957,11 @@ fn maybe_store_chat_post_generation_cache(
     if prefix_ids.is_empty() || prefix_ids.len() > prefix_cache_max_tokens() {
         return Ok(());
     }
-    let prompt_i32 = prefix_ids.iter().map(|id| *id as i32).collect::<Vec<_>>();
-    let input_ids = mlx_rs::Array::from_slice(&prompt_i32, &[1, prompt_i32.len() as i32]);
-    let mut state = session.qwen.new_decode_state(&session.plan)?;
-    let (logits, hidden, prompt_hidden) = session.qwen.prefill_decode_state_with_hidden_sequence(
-        &input_ids,
-        &session.plan,
-        &mut state,
-    )?;
-    if request.profile_timings {
-        logits.eval()?;
-        hidden.eval()?;
-        prompt_hidden.eval()?;
-    }
     let persistent_mtp = env_flag("MTPLX_PERSISTENT_MTP", true);
-    let mtp_history_state =
-        if persistent_mtp && request.mtp && request.depth > 0 && session.qwen.mtp.is_some() {
-            seed_mtp_history_from_prompt(session, &prefix_ids, &prompt_hidden)?
-        } else {
-            session.qwen.new_mtp_decode_state().unwrap_or_default()
-        };
-    state.clear_transient_block_states();
+    let needs_mtp_history =
+        persistent_mtp && request.mtp && request.depth > 0 && session.qwen.mtp.is_some();
+    let (state, logits, hidden, mtp_history_state) =
+        prepare_prompt_state_chunked(session, request, &prefix_ids, needs_mtp_history)?;
     maybe_store_prompt_cache(
         session,
         &prefix_ids,
@@ -1781,6 +1979,15 @@ fn prefix_cache_max_tokens() -> usize {
         .ok()
         .and_then(|value| value.trim().parse::<usize>().ok())
         .unwrap_or(DEFAULT_MAX_KV_CONTEXT_TOKENS)
+}
+
+#[cfg(feature = "native-mlx")]
+fn prefill_chunk_tokens() -> usize {
+    ferrite_env_var("MTPLX_PREFILL_CHUNK_TOKENS")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(128)
 }
 
 #[cfg(feature = "native-mlx")]
