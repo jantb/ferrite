@@ -8,7 +8,7 @@ set(CMAKE_CXX_STANDARD 17)
 
 # ----------------------------- Configuration -----------------------------
 if(NOT MLX_C_VERSION)
-  set(MLX_C_VERSION 0.2.0)
+  set(MLX_C_VERSION 0.5.0)
 endif()
 
 option(BUILD_SHARED_LIBS "Build mlx C as a shared library" OFF)
@@ -35,9 +35,10 @@ else()
   FetchContent_Declare(
     mlx
     GIT_REPOSITORY "https://github.com/ml-explore/mlx.git"
-    GIT_TAG v0.25.1
-    PATCH_COMMAND git apply --ignore-whitespace
-                  ${CMAKE_CURRENT_LIST_DIR}/patches/mlx-mtplx-qmv.patch)
+    GIT_TAG v0.31.2
+    PATCH_COMMAND
+      /bin/sh -c
+      "git apply --ignore-whitespace ${CMAKE_CURRENT_LIST_DIR}/patches/mlx-mtplx-qmv.patch || git apply --reverse --check --ignore-whitespace ${CMAKE_CURRENT_LIST_DIR}/patches/mlx-mtplx-qmv.patch")
   FetchContent_MakeAvailable(mlx)
 endif()
 
@@ -47,6 +48,7 @@ set(mlxc-src
     ${CMAKE_CURRENT_LIST_DIR}/mlx/c/array.cpp
     ${CMAKE_CURRENT_LIST_DIR}/mlx/c/closure.cpp
     ${CMAKE_CURRENT_LIST_DIR}/mlx/c/compile.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/mlx/c/cuda.cpp
     ${CMAKE_CURRENT_LIST_DIR}/mlx/c/device.cpp
     ${CMAKE_CURRENT_LIST_DIR}/mlx/c/distributed.cpp
     ${CMAKE_CURRENT_LIST_DIR}/mlx/c/distributed_group.cpp
@@ -76,6 +78,11 @@ target_link_libraries(mlxc PRIVATE mlx)
 target_include_directories(mlxc
                            PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_LIST_DIR}>)
 set_property(TARGET mlxc PROPERTY POSITION_INDEPENDENT_CODE ON)
+
+# Windows DLL symbol exports
+if(WIN32)
+  set_target_properties(mlxc PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS TRUE)
+endif()
 
 if(MLX_C_BUILD_EXAMPLES)
   add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/examples)

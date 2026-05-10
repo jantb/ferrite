@@ -8,6 +8,7 @@ fn build_and_link_mlx_c() {
     let mut config = Config::new("src/mlx-c");
     config.very_verbose(true);
     config.define("CMAKE_INSTALL_PREFIX", ".");
+    config.define("MLX_C_BUILD_EXAMPLES", "OFF");
 
     #[cfg(debug_assertions)]
     {
