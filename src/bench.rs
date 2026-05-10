@@ -75,12 +75,19 @@ pub struct PrefillProfileBenchResult {
     pub full_attention_s: f64,
     pub linear_attention_s: f64,
     pub mlp_s: f64,
+    pub mlp_compiled_s: f64,
+    pub mlp_gate_up_s: f64,
+    pub mlp_activation_s: f64,
+    pub mlp_down_s: f64,
     pub layer_glue_s: f64,
     pub final_norm_s: f64,
     pub lm_head_s: f64,
     pub full_attention_pct: f64,
     pub linear_attention_pct: f64,
     pub mlp_pct: f64,
+    pub mlp_gate_up_pct: f64,
+    pub mlp_activation_pct: f64,
+    pub mlp_down_pct: f64,
     pub layer_glue_pct: f64,
 }
 
@@ -679,6 +686,10 @@ pub fn run_prefill_profile_bench(
         profile_sum.full_attention_s += profile.full_attention_s;
         profile_sum.linear_attention_s += profile.linear_attention_s;
         profile_sum.mlp_s += profile.mlp_s;
+        profile_sum.mlp_compiled_s += profile.mlp_compiled_s;
+        profile_sum.mlp_gate_up_s += profile.mlp_gate_up_s;
+        profile_sum.mlp_activation_s += profile.mlp_activation_s;
+        profile_sum.mlp_down_s += profile.mlp_down_s;
         profile_sum.layer_glue_s += profile.layer_glue_s;
         profile_sum.final_norm_s += profile.final_norm_s;
         profile_sum.lm_head_s += profile.lm_head_s;
@@ -690,6 +701,10 @@ pub fn run_prefill_profile_bench(
     let full_attention_s = profile_sum.full_attention_s / divisor;
     let linear_attention_s = profile_sum.linear_attention_s / divisor;
     let mlp_s = profile_sum.mlp_s / divisor;
+    let mlp_compiled_s = profile_sum.mlp_compiled_s / divisor;
+    let mlp_gate_up_s = profile_sum.mlp_gate_up_s / divisor;
+    let mlp_activation_s = profile_sum.mlp_activation_s / divisor;
+    let mlp_down_s = profile_sum.mlp_down_s / divisor;
     let layer_glue_s = profile_sum.layer_glue_s / divisor;
     let final_norm_s = profile_sum.final_norm_s / divisor;
     let lm_head_s = profile_sum.lm_head_s / divisor;
@@ -705,12 +720,19 @@ pub fn run_prefill_profile_bench(
         full_attention_s,
         linear_attention_s,
         mlp_s,
+        mlp_compiled_s,
+        mlp_gate_up_s,
+        mlp_activation_s,
+        mlp_down_s,
         layer_glue_s,
         final_norm_s,
         lm_head_s,
         full_attention_pct: full_attention_s / avg_total_s.max(f64::EPSILON) * 100.0,
         linear_attention_pct: linear_attention_s / avg_total_s.max(f64::EPSILON) * 100.0,
         mlp_pct: mlp_s / avg_total_s.max(f64::EPSILON) * 100.0,
+        mlp_gate_up_pct: mlp_gate_up_s / avg_total_s.max(f64::EPSILON) * 100.0,
+        mlp_activation_pct: mlp_activation_s / avg_total_s.max(f64::EPSILON) * 100.0,
+        mlp_down_pct: mlp_down_s / avg_total_s.max(f64::EPSILON) * 100.0,
         layer_glue_pct: layer_glue_s / avg_total_s.max(f64::EPSILON) * 100.0,
     })
 }

@@ -40,7 +40,7 @@ impl LayerWeights {
         profile.layer_glue_s += started.elapsed().as_secs_f64();
 
         let started = Instant::now();
-        let mlp_out = self.mlp.forward(&mlp_normed)?;
+        let mlp_out = self.mlp.forward_profiled(&mlp_normed, profile)?;
         mlp_out.eval()?;
         profile.mlp_s += started.elapsed().as_secs_f64();
 

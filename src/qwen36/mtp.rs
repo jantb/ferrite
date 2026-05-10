@@ -34,11 +34,8 @@ impl MtpWeights {
             store.quantized_linear(format!("{layer_prefix}.mlp.gate_proj"), group_size, bits)?;
         let up_proj =
             store.quantized_linear(format!("{layer_prefix}.mlp.up_proj"), group_size, bits)?;
-        let fused_gate_up = if env_enabled("MTPLX_FUSE_MLP_PROJECTIONS") {
-            crate::mlx_backend::FusedQuantizedLinears::try_new(&[&gate_proj, &up_proj])?
-        } else {
-            None
-        };
+        let down_proj =
+            store.quantized_linear(format!("{layer_prefix}.mlp.down_proj"), group_size, bits)?;
         Ok(Self {
             pre_fc_norm_embedding: mtp_norm(
                 store,
@@ -78,16 +75,12 @@ impl MtpWeights {
                     q_norm: mtp_norm(store, &format!("{layer_prefix}.self_attn.q_norm"), eps)?,
                     k_norm: mtp_norm(store, &format!("{layer_prefix}.self_attn.k_norm"), eps)?,
                 }),
-                mlp: MlpWeights {
+                mlp: MlpWeights::new(
                     gate_proj,
                     up_proj,
-                    down_proj: store.quantized_linear(
-                        format!("{layer_prefix}.mlp.down_proj"),
-                        group_size,
-                        bits,
-                    )?,
-                    fused_gate_up,
-                },
+                    down_proj,
+                    env_enabled("MTPLX_FUSE_MLP_PROJECTIONS"),
+                )?,
             },
             norm: mtp_norm(store, &format!("{prefix}.norm"), eps)?,
         })

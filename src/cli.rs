@@ -581,6 +581,21 @@ fn bench_prefill_profile(args: BenchPrefillProfileArgs) -> Result<()> {
         );
         println!("mlp: {:.3}s ({:.1}%)", result.mlp_s, result.mlp_pct);
         println!(
+            "  gate/up: {:.3}s ({:.1}%)",
+            result.mlp_gate_up_s, result.mlp_gate_up_pct
+        );
+        println!(
+            "  activation: {:.3}s ({:.1}%)",
+            result.mlp_activation_s, result.mlp_activation_pct
+        );
+        println!(
+            "  down: {:.3}s ({:.1}%)",
+            result.mlp_down_s, result.mlp_down_pct
+        );
+        if result.mlp_compiled_s > 0.0 {
+            println!("  compiled: {:.3}s", result.mlp_compiled_s);
+        }
+        println!(
             "layer glue: {:.3}s ({:.1}%)",
             result.layer_glue_s, result.layer_glue_pct
         );

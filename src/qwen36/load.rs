@@ -54,17 +54,13 @@ impl Qwen36Weights {
                 norm(store, &format!("{prefix}.post_attention_layernorm"), eps)?;
             let gate_proj = qlinear(&format!("{prefix}.mlp.gate_proj"))?;
             let up_proj = qlinear(&format!("{prefix}.mlp.up_proj"))?;
-            let fused_gate_up = if env_enabled("MTPLX_FUSE_MLP_PROJECTIONS") {
-                crate::mlx_backend::FusedQuantizedLinears::try_new(&[&gate_proj, &up_proj])?
-            } else {
-                None
-            };
-            let mlp = MlpWeights {
+            let down_proj = qlinear(&format!("{prefix}.mlp.down_proj"))?;
+            let mlp = MlpWeights::new(
                 gate_proj,
                 up_proj,
-                down_proj: qlinear(&format!("{prefix}.mlp.down_proj"))?,
-                fused_gate_up,
-            };
+                down_proj,
+                env_enabled("MTPLX_FUSE_MLP_PROJECTIONS"),
+            )?;
             let attention = match layer.kind {
                 LayerKind::FullAttention => AttentionWeights::Full(FullAttentionWeights {
                     q_proj: qlinear(&format!("{prefix}.self_attn.q_proj"))?,
