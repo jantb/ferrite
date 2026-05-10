@@ -20,6 +20,42 @@ pub struct LayerWeights {
 }
 
 impl LayerWeights {
+    fn forward_residual_mlp(
+        &self,
+        x: &mlx_rs::Array,
+        attn_out: &mlx_rs::Array,
+    ) -> Result<mlx_rs::Array> {
+        let hidden = x + attn_out;
+        let mlp_normed = self.post_attention_norm.forward(&hidden)?;
+        let mlp_out = self.mlp.forward(&mlp_normed)?;
+        Ok(&hidden + &mlp_out)
+    }
+
+    fn forward_residual_mlp_profiled(
+        &self,
+        x: &mlx_rs::Array,
+        attn_out: &mlx_rs::Array,
+        profile: &mut DecodeProfileTimings,
+    ) -> Result<mlx_rs::Array> {
+        let started = Instant::now();
+        let hidden = x + attn_out;
+        let mlp_normed = self.post_attention_norm.forward(&hidden)?;
+        hidden.eval()?;
+        mlp_normed.eval()?;
+        profile.layer_glue_s += started.elapsed().as_secs_f64();
+
+        let started = Instant::now();
+        let mlp_out = self.mlp.forward(&mlp_normed)?;
+        mlp_out.eval()?;
+        profile.mlp_s += started.elapsed().as_secs_f64();
+
+        let started = Instant::now();
+        let output = &hidden + &mlp_out;
+        output.eval()?;
+        profile.layer_glue_s += started.elapsed().as_secs_f64();
+        Ok(output)
+    }
+
     pub fn forward_full_attention_no_rope(
         &self,
         x: &mlx_rs::Array,
@@ -32,10 +68,7 @@ impl LayerWeights {
         };
         let normed = self.input_norm.forward(x)?;
         let attn_out = attn.forward_unmasked_no_rope(&normed, num_heads, num_kv_heads, head_dim)?;
-        let hidden = x + &attn_out;
-        let mlp_normed = self.post_attention_norm.forward(&hidden)?;
-        let mlp_out = self.mlp.forward(&mlp_normed)?;
-        Ok(&hidden + &mlp_out)
+        self.forward_residual_mlp(x, &attn_out)
     }
 
     pub fn forward_full_attention_causal_rope(
@@ -61,10 +94,7 @@ impl LayerWeights {
             rope_theta,
             offset,
         )?;
-        let hidden = x + &attn_out;
-        let mlp_normed = self.post_attention_norm.forward(&hidden)?;
-        let mlp_out = self.mlp.forward(&mlp_normed)?;
-        Ok(&hidden + &mlp_out)
+        self.forward_residual_mlp(x, &attn_out)
     }
 
     pub fn forward_with_linear_attention_ablation(
@@ -111,10 +141,7 @@ impl LayerWeights {
             AttentionWeights::Linear(attn) => {
                 let normed = self.input_norm.forward(x)?;
                 let attn_out = attn.forward_reference(&normed, plan)?;
-                let hidden = x + &attn_out;
-                let mlp_normed = self.post_attention_norm.forward(&hidden)?;
-                let mlp_out = self.mlp.forward(&mlp_normed)?;
-                Ok(&hidden + &mlp_out)
+                self.forward_residual_mlp(x, &attn_out)
             }
         }
     }
@@ -139,18 +166,12 @@ impl LayerWeights {
                     position_offset,
                     cache,
                 )?;
-                let hidden = x + &attn_out;
-                let mlp_normed = self.post_attention_norm.forward(&hidden)?;
-                let mlp_out = self.mlp.forward(&mlp_normed)?;
-                Ok(&hidden + &mlp_out)
+                self.forward_residual_mlp(x, &attn_out)
             }
             (AttentionWeights::Linear(attn), LayerDecodeState::Linear(cache)) => {
                 let normed = self.input_norm.forward(x)?;
                 let attn_out = attn.forward_reference_with_cache(&normed, plan, cache)?;
-                let hidden = x + &attn_out;
-                let mlp_normed = self.post_attention_norm.forward(&hidden)?;
-                let mlp_out = self.mlp.forward(&mlp_normed)?;
-                Ok(&hidden + &mlp_out)
+                self.forward_residual_mlp(x, &attn_out)
             }
             _ => bail!("decode state kind does not match layer kind"),
         }
@@ -176,18 +197,12 @@ impl LayerWeights {
                     position_offset,
                     cache,
                 )?;
-                let hidden = x + &attn_out;
-                let mlp_normed = self.post_attention_norm.forward(&hidden)?;
-                let mlp_out = self.mlp.forward(&mlp_normed)?;
-                Ok(&hidden + &mlp_out)
+                self.forward_residual_mlp(x, &attn_out)
             }
             (AttentionWeights::Linear(attn), LayerDecodeState::Linear(cache)) => {
                 let normed = self.input_norm.forward(x)?;
                 let attn_out = attn.forward_reference_with_cache(&normed, plan, cache)?;
-                let hidden = x + &attn_out;
-                let mlp_normed = self.post_attention_norm.forward(&hidden)?;
-                let mlp_out = self.mlp.forward(&mlp_normed)?;
-                Ok(&hidden + &mlp_out)
+                self.forward_residual_mlp(x, &attn_out)
             }
             _ => bail!("decode state kind does not match layer kind"),
         }
@@ -213,18 +228,12 @@ impl LayerWeights {
                     position_offset,
                     cache,
                 )?;
-                let hidden = x + &attn_out;
-                let mlp_normed = self.post_attention_norm.forward(&hidden)?;
-                let mlp_out = self.mlp.forward(&mlp_normed)?;
-                Ok(&hidden + &mlp_out)
+                self.forward_residual_mlp(x, &attn_out)
             }
             (AttentionWeights::Linear(attn), LayerDecodeState::Linear(cache)) => {
                 let normed = self.input_norm.forward(x)?;
                 let attn_out = attn.forward_reference_with_cache(&normed, plan, cache)?;
-                let hidden = x + &attn_out;
-                let mlp_normed = self.post_attention_norm.forward(&hidden)?;
-                let mlp_out = self.mlp.forward(&mlp_normed)?;
-                Ok(&hidden + &mlp_out)
+                self.forward_residual_mlp(x, &attn_out)
             }
             _ => bail!("decode state kind does not match layer kind"),
         }
@@ -259,23 +268,7 @@ impl LayerWeights {
                 attn_out.eval()?;
                 profile.full_attention_s += started.elapsed().as_secs_f64();
 
-                let started = Instant::now();
-                let hidden = x + &attn_out;
-                let mlp_normed = self.post_attention_norm.forward(&hidden)?;
-                hidden.eval()?;
-                mlp_normed.eval()?;
-                profile.layer_glue_s += started.elapsed().as_secs_f64();
-
-                let started = Instant::now();
-                let mlp_out = self.mlp.forward(&mlp_normed)?;
-                mlp_out.eval()?;
-                profile.mlp_s += started.elapsed().as_secs_f64();
-
-                let started = Instant::now();
-                let output = &hidden + &mlp_out;
-                output.eval()?;
-                profile.layer_glue_s += started.elapsed().as_secs_f64();
-                Ok(output)
+                self.forward_residual_mlp_profiled(x, &attn_out, profile)
             }
             (AttentionWeights::Linear(attn), LayerDecodeState::Linear(cache)) => {
                 let started = Instant::now();
@@ -288,23 +281,7 @@ impl LayerWeights {
                 attn_out.eval()?;
                 profile.linear_attention_s += started.elapsed().as_secs_f64();
 
-                let started = Instant::now();
-                let hidden = x + &attn_out;
-                let mlp_normed = self.post_attention_norm.forward(&hidden)?;
-                hidden.eval()?;
-                mlp_normed.eval()?;
-                profile.layer_glue_s += started.elapsed().as_secs_f64();
-
-                let started = Instant::now();
-                let mlp_out = self.mlp.forward(&mlp_normed)?;
-                mlp_out.eval()?;
-                profile.mlp_s += started.elapsed().as_secs_f64();
-
-                let started = Instant::now();
-                let output = &hidden + &mlp_out;
-                output.eval()?;
-                profile.layer_glue_s += started.elapsed().as_secs_f64();
-                Ok(output)
+                self.forward_residual_mlp_profiled(x, &attn_out, profile)
             }
             _ => bail!("decode state kind does not match layer kind"),
         }
