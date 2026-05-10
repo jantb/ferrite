@@ -447,7 +447,12 @@ impl Qwen36Weights {
         let mut hidden = self.embeddings.forward(&input_ids)?;
         let eval_interval = prefill_layer_eval_interval();
         for (index, (layer, cache)) in self.layers.iter().zip(state.layers.iter_mut()).enumerate() {
-            hidden = layer.forward_decode_tokens(&hidden, plan, state.position, cache)?;
+            hidden = layer.forward_decode_tokens_without_block_states(
+                &hidden,
+                plan,
+                state.position,
+                cache,
+            )?;
             if should_eval_prefill_layer(index, eval_interval) {
                 hidden.eval()?;
                 eval_layer_decode_state(cache)?;
@@ -476,7 +481,12 @@ impl Qwen36Weights {
         let mut hidden = self.embeddings.forward(&input_ids)?;
         let eval_interval = prefill_layer_eval_interval();
         for (index, (layer, cache)) in self.layers.iter().zip(state.layers.iter_mut()).enumerate() {
-            hidden = layer.forward_decode_tokens(&hidden, plan, state.position, cache)?;
+            hidden = layer.forward_decode_tokens_without_block_states(
+                &hidden,
+                plan,
+                state.position,
+                cache,
+            )?;
             if should_eval_prefill_layer(index, eval_interval) {
                 hidden.eval()?;
                 eval_layer_decode_state(cache)?;

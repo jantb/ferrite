@@ -213,8 +213,27 @@ impl LinearAttentionWeights {
         plan: &Qwen36Plan,
         cache: &mut LinearAttentionCache,
     ) -> Result<mlx_rs::Array> {
+        self.forward_reference_with_cache_retaining_block_states(x, plan, cache, true)
+    }
+
+    pub fn forward_reference_with_cache_without_block_states(
+        &self,
+        x: &mlx_rs::Array,
+        plan: &Qwen36Plan,
+        cache: &mut LinearAttentionCache,
+    ) -> Result<mlx_rs::Array> {
+        self.forward_reference_with_cache_retaining_block_states(x, plan, cache, false)
+    }
+
+    fn forward_reference_with_cache_retaining_block_states(
+        &self,
+        x: &mlx_rs::Array,
+        plan: &Qwen36Plan,
+        cache: &mut LinearAttentionCache,
+        retain_block_states: bool,
+    ) -> Result<mlx_rs::Array> {
         if let Some(metal) = &self.metal {
-            return self.forward_metal_with_cache(x, plan, cache, metal);
+            return self.forward_metal_with_cache(x, plan, cache, metal, retain_block_states);
         }
 
         let shape = x.shape();
@@ -311,6 +330,7 @@ impl LinearAttentionWeights {
         plan: &Qwen36Plan,
         cache: &mut LinearAttentionCache,
         metal: &crate::metal_kernels::LinearGdnKernels,
+        retain_block_states: bool,
     ) -> Result<mlx_rs::Array> {
         let shape = x.shape();
         if shape.len() != 3 {
@@ -374,7 +394,11 @@ impl LinearAttentionWeights {
             keep,
         )?;
         cache.metal_conv_state = Some(conv_states.index((.., -1, .., ..)));
-        cache.metal_conv_block_states = if tokens > 1 { Some(conv_states) } else { None };
+        cache.metal_conv_block_states = if retain_block_states && tokens > 1 {
+            Some(conv_states)
+        } else {
+            None
+        };
 
         let (out, recurrent_states) = metal.gated_delta_inline(
             &conv_out,
@@ -394,7 +418,7 @@ impl LinearAttentionWeights {
             dv,
         )?;
         cache.metal_recurrent_state = Some(recurrent_states.index((.., -1, .., .., ..)));
-        cache.metal_recurrent_block_states = if tokens > 1 {
+        cache.metal_recurrent_block_states = if retain_block_states && tokens > 1 {
             Some(recurrent_states)
         } else {
             None

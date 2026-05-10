@@ -234,6 +234,38 @@ impl LayerWeights {
         }
     }
 
+    pub fn forward_decode_tokens_without_block_states(
+        &self,
+        x: &mlx_rs::Array,
+        plan: &Qwen36Plan,
+        position_offset: i32,
+        cache: &mut LayerDecodeState,
+    ) -> Result<mlx_rs::Array> {
+        match (&self.attention, cache) {
+            (AttentionWeights::Full(attn), LayerDecodeState::Full(cache)) => {
+                let normed = self.input_norm.forward(x)?;
+                let attn_out = attn.forward_decode_tokens(
+                    &normed,
+                    plan.num_attention_heads as i32,
+                    plan.num_key_value_heads as i32,
+                    plan.head_dim as i32,
+                    plan.rope_dimensions as i32,
+                    plan.rope_theta,
+                    position_offset,
+                    cache,
+                )?;
+                self.forward_residual_mlp(x, &attn_out)
+            }
+            (AttentionWeights::Linear(attn), LayerDecodeState::Linear(cache)) => {
+                let normed = self.input_norm.forward(x)?;
+                let attn_out =
+                    attn.forward_reference_with_cache_without_block_states(&normed, plan, cache)?;
+                self.forward_residual_mlp(x, &attn_out)
+            }
+            _ => bail!("decode state kind does not match layer kind"),
+        }
+    }
+
     pub fn forward_decode_tokens_profiled(
         &self,
         x: &mlx_rs::Array,
