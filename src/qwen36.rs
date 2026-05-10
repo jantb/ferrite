@@ -191,11 +191,13 @@ mod full_attention;
 #[cfg(feature = "native-mlx")]
 pub use full_attention::{FullAttentionProjection, FullAttentionWeights};
 #[cfg(feature = "native-mlx")]
+mod linear_attention;
+#[cfg(feature = "native-mlx")]
+pub use linear_attention::{LinearAttentionProjection, LinearAttentionWeights};
+#[cfg(feature = "native-mlx")]
 mod layers;
 #[cfg(feature = "native-mlx")]
-pub use layers::{
-    AttentionWeights, LayerWeights, LinearAttentionProjection, LinearAttentionWeights,
-};
+pub use layers::{AttentionWeights, LayerWeights};
 #[cfg(feature = "native-mlx")]
 mod mlp;
 #[cfg(feature = "native-mlx")]
