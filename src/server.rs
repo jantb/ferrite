@@ -9,7 +9,7 @@ use serde_json::json;
 use crate::api::{self, ChatCompletionRequest, CompletionRequest};
 use crate::inference::{InferenceBackend, NativeMlxBackend};
 
-const OLLAMA_TOOL_MAX_TOKENS: u32 = 256;
+const OLLAMA_TOOL_MAX_TOKENS: u32 = 1024;
 const TOOL_CALL_OPEN: &str = "<tool_call>";
 const TOOL_CALL_CLOSE: &str = "</tool_call>";
 const MAX_BUFFERED_TOOL_CALL_CHARS: usize = 64 * 1024;
@@ -786,6 +786,8 @@ fn bound_ollama_tool_request(request: &mut crate::inference::InferenceRequest) {
             .unwrap_or(OLLAMA_TOOL_MAX_TOKENS)
             .min(OLLAMA_TOOL_MAX_TOKENS),
     );
+    request.temperature = request.temperature.min(0.2);
+    request.top_k = request.top_k.min(20).max(1);
     request.mtp = false;
     if !request.stop.iter().any(|stop| stop == TOOL_CALL_CLOSE) {
         request.stop.push(TOOL_CALL_CLOSE.to_string());
@@ -1138,6 +1140,8 @@ mod tests {
         bound_ollama_tool_request(&mut request);
 
         assert_eq!(request.max_tokens, Some(OLLAMA_TOOL_MAX_TOKENS));
+        assert_eq!(request.temperature, 0.2);
+        assert_eq!(request.top_k, 20);
         assert!(!request.mtp);
         assert_eq!(request.stop, vec![TOOL_CALL_CLOSE.to_string()]);
     }
@@ -1178,6 +1182,8 @@ mod tests {
         bound_ollama_tool_request(&mut request);
 
         assert_eq!(request.max_tokens, Some(OLLAMA_TOOL_MAX_TOKENS));
+        assert_eq!(request.temperature, 0.2);
+        assert_eq!(request.top_k, 20);
         assert!(!request.mtp);
         assert_eq!(request.stop, vec![TOOL_CALL_CLOSE.to_string()]);
     }
