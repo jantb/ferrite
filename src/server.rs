@@ -17,6 +17,117 @@ pub struct ServerConfig {
     pub model_id: String,
 }
 
+#[derive(Clone, Debug, Deserialize)]
+struct OllamaChatRequest {
+    model: Option<String>,
+    messages: Vec<OllamaMessage>,
+    tools: Option<Vec<OllamaTool>>,
+    stream: Option<bool>,
+    think: Option<bool>,
+    options: Option<OllamaOptions>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct OllamaMessage {
+    role: String,
+    content: serde_json::Value,
+    tool_calls: Option<Vec<OllamaToolCall>>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct OllamaOptions {
+    temperature: Option<f32>,
+    top_p: Option<f32>,
+    top_k: Option<u32>,
+    num_predict: Option<u32>,
+    num_ctx: Option<u32>,
+    stop: Option<serde_json::Value>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct OllamaTool {
+    #[serde(rename = "type")]
+    kind: String,
+    function: OllamaToolDefinition,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct OllamaToolDefinition {
+    name: String,
+    description: Option<String>,
+    parameters: serde_json::Value,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct OllamaToolCall {
+    function: OllamaFunctionCall,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct OllamaFunctionCall {
+    name: String,
+    #[serde(default)]
+    arguments: serde_json::Value,
+}
+
+impl OllamaChatRequest {
+    fn into_inference(
+        self,
+        default_model: &str,
+        public_model_id: &str,
+    ) -> crate::inference::InferenceRequest {
+        let options = self.options.unwrap_or_default();
+        let _requested_num_ctx = options.num_ctx;
+        let _think = self.think.unwrap_or(false);
+        let tools_prompt = ollama_tools_prompt(self.tools.as_deref().unwrap_or(&[]));
+        let messages = self
+            .messages
+            .into_iter()
+            .map(|message| api::ChatMessage {
+                role: ollama_message_role(&message.role).to_string(),
+                content: serde_json::Value::String(ollama_message_content(message)),
+            })
+            .collect::<Vec<_>>();
+        let mut request = ChatCompletionRequest {
+            model: self.model,
+            messages,
+            max_tokens: options.num_predict,
+            max_completion_tokens: None,
+            temperature: options.temperature,
+            top_p: options.top_p,
+            top_k: options.top_k,
+            stop: options.stop,
+            stream: self.stream,
+            generation_mode: None,
+        }
+        .into_inference(default_model, public_model_id);
+        if let Some(tools_prompt) = tools_prompt {
+            request.system = Some(match request.system {
+                Some(system) if !system.is_empty() => format!("{system}\n\n{tools_prompt}"),
+                _ => tools_prompt,
+            });
+        }
+        request
+    }
+
+    fn has_tools(&self) -> bool {
+        self.tools.as_ref().is_some_and(|tools| !tools.is_empty())
+    }
+}
+
+impl Default for OllamaOptions {
+    fn default() -> Self {
+        Self {
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            num_predict: None,
+            num_ctx: None,
+            stop: None,
+        }
+    }
+}
+
 pub fn serve(config: ServerConfig) -> Result<()> {
     let listener = TcpListener::bind((&*config.host, config.port))
         .with_context(|| format!("bind {}:{}", config.host, config.port))?;
@@ -24,7 +135,6 @@ pub fn serve(config: ServerConfig) -> Result<()> {
         "Ferrite server listening on http://{}:{}",
         config.host, config.port
     );
-    println!("Python dependency: no");
     println!("Native backend: {}", NativeMlxBackend::status());
     let backend = NativeMlxBackend::new();
     let preload_s = backend.preload(&config.model)?;
@@ -110,6 +220,95 @@ fn handle_connection(
                 }]
             }),
         )?,
+        ("GET", "/api/tags") => write_json(
+            &mut stream,
+            200,
+            &json!({
+                "models": [{
+                    "name": config.model_id,
+                    "model": config.model_id,
+                    "modified_at": iso_time(),
+                    "size": 0,
+                    "digest": "ferrite-local",
+                    "details": {
+                        "parent_model": "",
+                        "format": "safetensors",
+                        "family": "qwen3.6",
+                        "families": ["qwen3.6"],
+                        "parameter_size": "27B",
+                        "quantization_level": "4-bit"
+                    }
+                }]
+            }),
+        )?,
+        ("GET", "/api/version") => write_json(
+            &mut stream,
+            200,
+            &json!({"version": env!("CARGO_PKG_VERSION")}),
+        )?,
+        ("POST", "/api/show") => write_json(
+            &mut stream,
+            200,
+            &json!({
+                "modelfile": "",
+                "parameters": "num_ctx 65536",
+                "model_info": {
+                    "general.architecture": "qwen3.6",
+                    "general.context_length": 262144,
+                    "qwen3.6.context_length": 262144
+                }
+            }),
+        )?,
+        ("POST", "/api/chat") => {
+            let parsed: OllamaChatRequest = serde_json::from_str(body)?;
+            let response_model = parsed
+                .model
+                .clone()
+                .unwrap_or_else(|| config.model_id.clone());
+            let wants_stream = parsed.stream.unwrap_or(true);
+            let has_tools = parsed.has_tools();
+            let request = parsed.into_inference(&config.model, &config.model_id);
+            if wants_stream && request.stop.is_empty() && !has_tools {
+                write_ollama_chat_stream(&mut stream, backend, &request, &response_model)?;
+                return Ok(());
+            }
+            match backend.infer(&request) {
+                Ok(response) if wants_stream => {
+                    let (content, tool_calls) = extract_ollama_tool_calls(&response.text);
+                    write_ollama_chat_compat_stream(
+                        &mut stream,
+                        &response_model,
+                        &content,
+                        &tool_calls,
+                    )?
+                }
+                Ok(response) => {
+                    let (content, tool_calls) = extract_ollama_tool_calls(&response.text);
+                    let mut message = json!({"role": "assistant", "content": content});
+                    if !tool_calls.is_empty() {
+                        message["tool_calls"] = json!(tool_calls);
+                    }
+                    write_json(
+                        &mut stream,
+                        200,
+                        &json!({
+                            "model": response_model,
+                            "created_at": iso_time(),
+                            "message": message,
+                            "done_reason": ollama_done_reason(&response.finish_reason),
+                            "done": true,
+                            "prompt_eval_count": response.prompt_tokens,
+                            "eval_count": response.completion_tokens
+                        }),
+                    )?
+                }
+                Err(err) => write_json(
+                    &mut stream,
+                    500,
+                    &api::error(err.to_string(), "backend_error"),
+                )?,
+            }
+        }
         ("POST", "/v1/chat/completions") => {
             let parsed: ChatCompletionRequest = serde_json::from_str(body)?;
             let wants_stream = parsed.stream.unwrap_or(false);
@@ -272,6 +471,81 @@ fn write_chat_sse_live(
     Ok(())
 }
 
+fn write_ollama_chat_stream(
+    stream: &mut TcpStream,
+    backend: &NativeMlxBackend,
+    request: &crate::inference::InferenceRequest,
+    model: &str,
+) -> Result<()> {
+    write_ndjson_headers(stream)?;
+    let result = backend.infer_stream(request, |delta| {
+        write_json_line(
+            stream,
+            &json!({
+                "model": model,
+                "created_at": iso_time(),
+                "message": {"role": "assistant", "content": delta},
+                "done": false
+            }),
+        )
+    });
+    match result {
+        Ok(response) => write_json_line(
+            stream,
+            &json!({
+                "model": model,
+                "created_at": iso_time(),
+                "message": {"role": "assistant", "content": ""},
+                "done_reason": ollama_done_reason(&response.finish_reason),
+                "done": true,
+                "prompt_eval_count": response.prompt_tokens,
+                "eval_count": response.completion_tokens
+            }),
+        )?,
+        Err(err) => write_json_line(
+            stream,
+            &json!({
+                "error": err.to_string(),
+                "done": true
+            }),
+        )?,
+    }
+    Ok(())
+}
+
+fn write_ollama_chat_compat_stream(
+    stream: &mut TcpStream,
+    model: &str,
+    text: &str,
+    tool_calls: &[OllamaToolCall],
+) -> Result<()> {
+    write_ndjson_headers(stream)?;
+    if !text.is_empty() || !tool_calls.is_empty() {
+        let mut message = json!({"role": "assistant", "content": text});
+        if !tool_calls.is_empty() {
+            message["tool_calls"] = json!(tool_calls);
+        }
+        write_json_line(
+            stream,
+            &json!({
+                "model": model,
+                "created_at": iso_time(),
+                "message": message,
+                "done": false
+            }),
+        )?;
+    }
+    write_json_line(
+        stream,
+        &json!({
+            "model": model,
+            "created_at": iso_time(),
+            "message": {"role": "assistant", "content": ""},
+            "done": true
+        }),
+    )
+}
+
 fn write_completion_sse_live(
     stream: &mut TcpStream,
     backend: &NativeMlxBackend,
@@ -409,6 +683,122 @@ fn write_sse_event<T: Serialize>(stream: &mut TcpStream, value: &T) -> Result<()
     Ok(())
 }
 
+fn write_ndjson_headers(stream: &mut TcpStream) -> Result<()> {
+    write!(
+        stream,
+        "HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nConnection: close\r\n\r\n"
+    )?;
+    Ok(())
+}
+
+fn write_json_line<T: Serialize>(stream: &mut TcpStream, value: &T) -> Result<()> {
+    let body = serde_json::to_string(value)?;
+    writeln!(stream, "{body}")?;
+    Ok(())
+}
+
+fn ollama_message_role(role: &str) -> &str {
+    if role == "tool" { "user" } else { role }
+}
+
+fn ollama_message_content(message: OllamaMessage) -> String {
+    let mut content = api::content_to_text(&message.content);
+    if message.role == "tool" {
+        return format!("<tool_response>\n{content}\n</tool_response>");
+    }
+    if let Some(tool_calls) = message.tool_calls {
+        for call in tool_calls {
+            if let Ok(body) = serde_json::to_string(&json!({
+                "name": call.function.name,
+                "arguments": call.function.arguments
+            })) {
+                if !content.is_empty() {
+                    content.push('\n');
+                }
+                content.push_str("<tool_call>\n");
+                content.push_str(&body);
+                content.push_str("\n</tool_call>");
+            }
+        }
+    }
+    content
+}
+
+fn ollama_tools_prompt(tools: &[OllamaTool]) -> Option<String> {
+    if tools.is_empty() {
+        return None;
+    }
+    let mut out = String::from(
+        "# Tools\n\nYou may call one or more functions to help with the user request.\n\n\
+         You are provided with function signatures inside <tools></tools> XML tags:\n<tools>\n",
+    );
+    for tool in tools {
+        if let Ok(line) = serde_json::to_string(tool) {
+            out.push_str(&line);
+            out.push('\n');
+        }
+    }
+    out.push_str(
+        "</tools>\n\nFor each function call, return a JSON object with function name and arguments \
+         inside <tool_call></tool_call> XML tags:\n<tool_call>\n\
+         {\"name\":\"function_name\",\"arguments\":{\"arg\":\"value\"}}\n</tool_call>",
+    );
+    Some(out)
+}
+
+fn extract_ollama_tool_calls(text: &str) -> (String, Vec<OllamaToolCall>) {
+    let mut remaining = text;
+    let mut visible = String::new();
+    let mut calls = Vec::new();
+    while let Some(start) = remaining.find("<tool_call>") {
+        visible.push_str(&remaining[..start]);
+        let after_start = &remaining[start + "<tool_call>".len()..];
+        let Some(end) = after_start.find("</tool_call>") else {
+            visible.push_str(&remaining[start..]);
+            return (visible.trim().to_string(), calls);
+        };
+        let body = after_start[..end].trim();
+        match serde_json::from_str::<serde_json::Value>(body)
+            .ok()
+            .and_then(ollama_tool_call_from_value)
+        {
+            Some(call) => calls.push(call),
+            None => {
+                visible.push_str("<tool_call>");
+                visible.push_str(body);
+                visible.push_str("</tool_call>");
+            }
+        }
+        remaining = &after_start[end + "</tool_call>".len()..];
+    }
+    visible.push_str(remaining);
+    (visible.trim().to_string(), calls)
+}
+
+fn ollama_tool_call_from_value(value: serde_json::Value) -> Option<OllamaToolCall> {
+    if let Some(array) = value.as_array() {
+        return array.first().cloned().and_then(ollama_tool_call_from_value);
+    }
+    if let Some(function) = value.get("function") {
+        let name = function.get("name")?.as_str()?.to_string();
+        let arguments = function
+            .get("arguments")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        return Some(OllamaToolCall {
+            function: OllamaFunctionCall { name, arguments },
+        });
+    }
+    let name = value.get("name")?.as_str()?.to_string();
+    let arguments = value
+        .get("arguments")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    Some(OllamaToolCall {
+        function: OllamaFunctionCall { name, arguments },
+    })
+}
+
 fn request_complete(buffer: &[u8]) -> bool {
     let Some(header_end) = find_subsequence(buffer, b"\r\n\r\n") else {
         return false;
@@ -437,6 +827,7 @@ fn write_json<T: Serialize>(stream: &mut TcpStream, status: u16, value: &T) -> R
         400 => "Bad Request",
         404 => "Not Found",
         413 => "Payload Too Large",
+        500 => "Internal Server Error",
         501 => "Not Implemented",
         _ => "OK",
     };
@@ -460,4 +851,79 @@ fn unix_time() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
         .unwrap_or(0)
+}
+
+fn iso_time() -> &'static str {
+    "1970-01-01T00:00:00Z"
+}
+
+fn ollama_done_reason(reason: &crate::inference::FinishReason) -> &'static str {
+    match reason {
+        crate::inference::FinishReason::Stop => "stop",
+        crate::inference::FinishReason::Length => "length",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ollama_tool_prompt_contains_serialized_tools() {
+        let prompt = ollama_tools_prompt(&[OllamaTool {
+            kind: "function".to_string(),
+            function: OllamaToolDefinition {
+                name: "read_file".to_string(),
+                description: Some("Read a file".to_string()),
+                parameters: json!({"type": "object"}),
+            },
+        }])
+        .unwrap();
+
+        assert!(prompt.contains("<tools>"));
+        assert!(prompt.contains("\"name\":\"read_file\""));
+        assert!(prompt.contains("<tool_call>"));
+    }
+
+    #[test]
+    fn ollama_message_content_renders_tool_history() {
+        let content = ollama_message_content(OllamaMessage {
+            role: "assistant".to_string(),
+            content: serde_json::Value::String(String::new()),
+            tool_calls: Some(vec![OllamaToolCall {
+                function: OllamaFunctionCall {
+                    name: "list_dir".to_string(),
+                    arguments: json!({"path": "."}),
+                },
+            }]),
+        });
+
+        assert!(content.contains("<tool_call>"));
+        assert!(content.contains("\"name\":\"list_dir\""));
+        assert!(content.contains("\"path\":\".\""));
+    }
+
+    #[test]
+    fn ollama_message_content_maps_tool_result_to_user_payload() {
+        let content = ollama_message_content(OllamaMessage {
+            role: "tool".to_string(),
+            content: serde_json::Value::String("file contents".to_string()),
+            tool_calls: None,
+        });
+
+        assert_eq!(content, "<tool_response>\nfile contents\n</tool_response>");
+        assert_eq!(ollama_message_role("tool"), "user");
+    }
+
+    #[test]
+    fn extract_ollama_tool_calls_removes_blocks_from_visible_text() {
+        let (text, calls) = extract_ollama_tool_calls(
+            "I will inspect.\n<tool_call>\n{\"name\":\"read_file\",\"arguments\":{\"path\":\"Cargo.toml\"}}\n</tool_call>",
+        );
+
+        assert_eq!(text, "I will inspect.");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "read_file");
+        assert_eq!(calls[0].function.arguments["path"], "Cargo.toml");
+    }
 }
