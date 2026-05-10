@@ -10,6 +10,7 @@ use cache::{
     with_gate_up_swiglu_qmv4_kernel, with_multi3_qmv4_kernel, with_small_m_qmm4_kernel,
     with_small_m_qmv4_kernel,
 };
+#[cfg(test)]
 pub(super) use config::small_m_qmv4_m_values_from_str;
 pub use config::{
     gate_up_swiglu_qmv4_enabled, small_m_qmm4_enabled, small_m_qmv4_enabled, small_m_qmv4_strict,
