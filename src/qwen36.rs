@@ -695,7 +695,6 @@ impl FullAttentionWeights {
             offset,
             None,
         )?;
-        cache.set_prefill(k.clone(), projected.v.clone());
         let attended = mlx_rs::fast::scaled_dot_product_attention(
             &q,
             &k,
@@ -703,12 +702,14 @@ impl FullAttentionWeights {
             1.0 / (head_dim as f32).sqrt(),
             mlx_rs::fast::ScaledDotProductAttentionMask::Causal,
         )?;
+        let gate = projected.gate;
+        cache.set_prefill(k, projected.v)?;
         let merged = attended.transpose_axes(&[0, 2, 1, 3])?.reshape(&[
             batch,
             tokens,
             num_heads * head_dim,
         ])?;
-        let merged = apply_attention_gate(merged, projected.gate.as_ref())?;
+        let merged = apply_attention_gate(merged, gate.as_ref())?;
         self.o_proj.forward(&merged)
     }
 

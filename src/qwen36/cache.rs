@@ -46,10 +46,41 @@ impl FullAttentionCache {
         self.offset = new_len.clamp(0, self.capacity());
     }
 
-    pub fn set_prefill(&mut self, k: mlx_rs::Array, v: mlx_rs::Array) {
-        self.offset = k.shape().get(2).copied().unwrap_or(0);
-        self.k = Some(k);
-        self.v = Some(v);
+    pub fn set_prefill(&mut self, k: mlx_rs::Array, v: mlx_rs::Array) -> Result<()> {
+        let k_shape = k.shape();
+        let v_shape = v.shape();
+        if k_shape.len() != 4 || v_shape.len() != 4 {
+            bail!("full-attention prefill cache expects [batch, heads, tokens, dim]");
+        }
+        if k_shape[0..3] != v_shape[0..3] {
+            bail!(
+                "full-attention prefill key/value cache shapes do not match: {k_shape:?} vs {v_shape:?}"
+            );
+        }
+        let len = k_shape[2];
+        if full_kv_cache_append_mode() == FullKvCacheAppendMode::Concat
+            || !prefill_reserve_enabled()
+        {
+            self.offset = len;
+            self.k = Some(k);
+            self.v = Some(v);
+            return Ok(());
+        }
+
+        self.offset = 0;
+        self.k = None;
+        self.v = None;
+        self.ensure_capacity(len + 1, &k, &v)?;
+        self.k
+            .as_mut()
+            .expect("full-attention key cache was just allocated")
+            .try_index_mut((.., .., 0..len, ..), k)?;
+        self.v
+            .as_mut()
+            .expect("full-attention value cache was just allocated")
+            .try_index_mut((.., .., 0..len, ..), v)?;
+        self.offset = len;
+        Ok(())
     }
 
     pub fn active_k(&self) -> Result<mlx_rs::Array> {
@@ -232,6 +263,16 @@ fn full_kv_cache_append_mode() -> FullKvCacheAppendMode {
         "concat" => FullKvCacheAppendMode::Concat,
         _ => FullKvCacheAppendMode::TailOwned,
     }
+}
+
+#[cfg(feature = "native-mlx")]
+fn prefill_reserve_enabled() -> bool {
+    std::env::var("FERRITE_FULL_KV_CACHE_PREFILL_RESERVE")
+        .map(|value| {
+            let value = value.trim().to_ascii_lowercase();
+            !matches!(value.as_str(), "0" | "false" | "no" | "off")
+        })
+        .unwrap_or(true)
 }
 
 #[derive(Clone, Debug)]
