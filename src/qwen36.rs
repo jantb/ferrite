@@ -191,8 +191,12 @@ mod layers;
 #[cfg(feature = "native-mlx")]
 pub use layers::{
     AttentionWeights, FullAttentionProjection, FullAttentionWeights, LayerWeights,
-    LinearAttentionProjection, LinearAttentionWeights, MlpWeights,
+    LinearAttentionProjection, LinearAttentionWeights,
 };
+#[cfg(feature = "native-mlx")]
+mod mlp;
+#[cfg(feature = "native-mlx")]
+pub use mlp::MlpWeights;
 
 #[cfg(feature = "native-mlx")]
 impl Qwen36Weights {
