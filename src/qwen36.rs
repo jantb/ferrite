@@ -11,6 +11,8 @@ use anyhow::{Result, bail};
 use mlx_rs::ops::concatenate_axis;
 #[cfg(feature = "native-mlx")]
 use mlx_rs::ops::indexing::IndexOp;
+#[cfg(feature = "native-mlx")]
+use mlx_rs::ops::indexing::TryIndexMutOp;
 use serde::Serialize;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -180,6 +182,139 @@ pub enum LayerDecodeState {
 pub struct FullAttentionCache {
     pub k: Option<mlx_rs::Array>,
     pub v: Option<mlx_rs::Array>,
+    pub offset: i32,
+}
+
+#[cfg(feature = "native-mlx")]
+impl FullAttentionCache {
+    fn capacity_step() -> i32 {
+        std::env::var("FERRITE_FULL_KV_CACHE_STEP")
+            .ok()
+            .and_then(|value| value.trim().parse::<i32>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(2048)
+    }
+
+    fn current_len(&self) -> i32 {
+        self.offset.max(0)
+    }
+
+    fn capacity(&self) -> i32 {
+        self.k
+            .as_ref()
+            .and_then(|array| array.shape().get(2).copied())
+            .unwrap_or(0)
+    }
+
+    pub fn truncate(&mut self, new_len: i32) {
+        self.offset = new_len.clamp(0, self.capacity());
+    }
+
+    pub fn set_prefill(&mut self, k: mlx_rs::Array, v: mlx_rs::Array) {
+        self.offset = k.shape().get(2).copied().unwrap_or(0);
+        self.k = Some(k);
+        self.v = Some(v);
+    }
+
+    pub fn active_k(&self) -> Result<mlx_rs::Array> {
+        let k = self
+            .k
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("missing full-attention key cache"))?;
+        let len = self.current_len();
+        if len >= k.shape()[2] {
+            Ok(k.clone())
+        } else {
+            Ok(k.index((.., .., 0..len, ..)))
+        }
+    }
+
+    pub fn active_v(&self) -> Result<mlx_rs::Array> {
+        let v = self
+            .v
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("missing full-attention value cache"))?;
+        let len = self.current_len();
+        if len >= v.shape()[2] {
+            Ok(v.clone())
+        } else {
+            Ok(v.index((.., .., 0..len, ..)))
+        }
+    }
+
+    pub fn append_and_fetch(
+        &mut self,
+        k: mlx_rs::Array,
+        v: mlx_rs::Array,
+    ) -> Result<(mlx_rs::Array, mlx_rs::Array, i32)> {
+        let k_shape = k.shape();
+        let v_shape = v.shape();
+        if k_shape.len() != 4 || v_shape.len() != 4 {
+            bail!("full-attention cache append expects [batch, heads, tokens, dim]");
+        }
+        if k_shape[0..3] != v_shape[0..3] {
+            bail!("full-attention key/value cache shapes do not match: {k_shape:?} vs {v_shape:?}");
+        }
+        let prev = self.current_len();
+        let steps = k_shape[2];
+        let end = prev + steps;
+        self.ensure_capacity(end, &k, &v)?;
+        self.k
+            .as_mut()
+            .expect("full-attention key cache was just allocated")
+            .try_index_mut((.., .., prev..end, ..), k)?;
+        self.v
+            .as_mut()
+            .expect("full-attention value cache was just allocated")
+            .try_index_mut((.., .., prev..end, ..), v)?;
+        self.offset = end;
+        Ok((self.active_k()?, self.active_v()?, prev))
+    }
+
+    fn ensure_capacity(
+        &mut self,
+        required: i32,
+        k: &mlx_rs::Array,
+        v: &mlx_rs::Array,
+    ) -> Result<()> {
+        if self.k.is_some() && self.v.is_some() && self.capacity() >= required {
+            return Ok(());
+        }
+
+        let prev = self.current_len();
+        let step = Self::capacity_step();
+        let capacity = ((required + step - 1) / step) * step;
+        let k_shape = k.shape();
+        let v_shape = v.shape();
+        let new_k_shape = [k_shape[0], k_shape[1], capacity, k_shape[3]];
+        let new_v_shape = [v_shape[0], v_shape[1], capacity, v_shape[3]];
+        let mut next_k = mlx_rs::ops::zeros_dtype(&new_k_shape, k.dtype())?;
+        let mut next_v = mlx_rs::ops::zeros_dtype(&new_v_shape, v.dtype())?;
+
+        if prev > 0 {
+            if let Some(old_k) = self.k.as_ref() {
+                let active = if prev >= old_k.shape()[2] {
+                    old_k.clone()
+                } else {
+                    old_k.index((.., .., 0..prev, ..))
+                };
+                next_k.try_index_mut((.., .., 0..prev, ..), active)?;
+            }
+            if let Some(old_v) = self.v.as_ref() {
+                let active = if prev >= old_v.shape()[2] {
+                    old_v.clone()
+                } else {
+                    old_v.index((.., .., 0..prev, ..))
+                };
+                next_v.try_index_mut((.., .., 0..prev, ..), active)?;
+            }
+        }
+
+        self.k = Some(next_k);
+        self.v = Some(next_v);
+        self.offset = prev;
+        Ok(())
+    }
 }
 
 #[cfg(feature = "native-mlx")]
@@ -226,22 +361,7 @@ impl DecodeState {
         for layer in &mut self.layers {
             match layer {
                 LayerDecodeState::Full(cache) => {
-                    if let Some(k) = cache.k.take() {
-                        let current = k.shape().get(2).copied().unwrap_or(0);
-                        cache.k = Some(if current > new_position {
-                            k.index((.., .., 0..new_position, ..))
-                        } else {
-                            k
-                        });
-                    }
-                    if let Some(v) = cache.v.take() {
-                        let current = v.shape().get(2).copied().unwrap_or(0);
-                        cache.v = Some(if current > new_position {
-                            v.index((.., .., 0..new_position, ..))
-                        } else {
-                            v
-                        });
-                    }
+                    cache.truncate(new_position);
                 }
                 LayerDecodeState::Linear(cache) => {
                     if keep_tokens == decoded_tokens {
@@ -797,8 +917,7 @@ impl FullAttentionWeights {
             offset,
             None,
         )?;
-        cache.k = Some(k.clone());
-        cache.v = Some(projected.v.clone());
+        cache.set_prefill(k.clone(), projected.v.clone());
         let attended = mlx_rs::fast::scaled_dot_product_attention(
             &q,
             &k,
@@ -850,20 +969,11 @@ impl FullAttentionWeights {
             offset,
             None,
         )?;
-        let next_k = match cache.k.take() {
-            Some(prev) => concatenate_axis(&[prev, k], 2)?,
-            None => k,
-        };
-        let next_v = match cache.v.take() {
-            Some(prev) => concatenate_axis(&[prev, projected.v], 2)?,
-            None => projected.v,
-        };
-        cache.k = Some(next_k);
-        cache.v = Some(next_v);
+        let (active_k, active_v, _) = cache.append_and_fetch(k, projected.v)?;
         let attended = mlx_rs::fast::scaled_dot_product_attention(
             &q,
-            cache.k.as_ref().expect("k cache was just set"),
-            cache.v.as_ref().expect("v cache was just set"),
+            &active_k,
+            &active_v,
             1.0 / (head_dim as f32).sqrt(),
             None,
         )?;
@@ -923,24 +1033,13 @@ impl FullAttentionWeights {
             offset,
             None,
         )?;
-        let prev_k = cache.k.take();
-        let prev_len = prev_k.as_ref().map(|prev| prev.shape()[2]).unwrap_or(0);
-        let next_k = match prev_k {
-            Some(prev) => concatenate_axis(&[prev, k], 2)?,
-            None => k,
-        };
-        let next_v = match cache.v.take() {
-            Some(prev) => concatenate_axis(&[prev, projected.v], 2)?,
-            None => projected.v,
-        };
-        let total_keys = next_k.shape()[2];
-        cache.k = Some(next_k);
-        cache.v = Some(next_v);
+        let (active_k, active_v, prev_len) = cache.append_and_fetch(k, projected.v)?;
+        let total_keys = active_k.shape()[2];
         let mask = decode_block_causal_mask(tokens, total_keys, prev_len, q.dtype())?;
         let attended = mlx_rs::fast::scaled_dot_product_attention(
             &q,
-            cache.k.as_ref().expect("k cache was just set"),
-            cache.v.as_ref().expect("v cache was just set"),
+            &active_k,
+            &active_v,
             1.0 / (head_dim as f32).sqrt(),
             &mask,
         )?;
@@ -1921,6 +2020,28 @@ impl Qwen36Weights {
         let last = input.len() as i32 - 1;
         self.final_norm
             .forward(&hidden.index((.., last..last + 1, ..)))
+    }
+
+    pub fn decode_tokens_cache_only(
+        &self,
+        input_ids: &[u32],
+        plan: &Qwen36Plan,
+        state: &mut DecodeState,
+    ) -> Result<()> {
+        if input_ids.is_empty() {
+            bail!("decode token block cannot be empty");
+        }
+        if state.layers.len() != self.layers.len() {
+            bail!("decode state layer count mismatch");
+        }
+        let input = input_ids.iter().map(|id| *id as i32).collect::<Vec<_>>();
+        let input_ids = mlx_rs::Array::from_slice(&input, &[1, input.len() as i32]);
+        let mut hidden = self.embeddings.forward(&input_ids)?;
+        for (layer, cache) in self.layers.iter().zip(state.layers.iter_mut()) {
+            hidden = layer.forward_decode_tokens(&hidden, plan, state.position, cache)?;
+        }
+        state.position += input.len() as i32;
+        Ok(())
     }
 
     pub fn logits_from_hidden(&self, hidden: &mlx_rs::Array) -> Result<mlx_rs::Array> {

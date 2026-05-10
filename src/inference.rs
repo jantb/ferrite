@@ -1550,8 +1550,35 @@ fn prepare_prompt_state_chunked(
     };
 
     let chunk_tokens = prefill_chunk_tokens();
+    let mut consumed_tokens = 0_usize;
     for (chunk_index, chunk) in prompt_ids.chunks(chunk_tokens).enumerate() {
         check_kill_switch("prefill_chunk_before")?;
+        let is_last_chunk = consumed_tokens + chunk.len() == prompt_ids.len();
+        consumed_tokens += chunk.len();
+
+        if !needs_mtp_history && !is_last_chunk {
+            session
+                .qwen
+                .decode_tokens_cache_only(chunk, &session.plan, &mut state)?;
+            state.clear_transient_block_states();
+            eval_decode_state(&state)?;
+            clear_mlx_cache();
+
+            if memory_trace_enabled() {
+                log_memory_sample(
+                    "infer",
+                    "prefill_chunk_cache_only",
+                    &format!(
+                        "chunk_index={chunk_index} chunk_tokens={} position={}",
+                        chunk.len(),
+                        state.position
+                    ),
+                );
+            }
+            check_kill_switch("prefill_chunk_after")?;
+            continue;
+        }
+
         let previous_hidden = hidden.clone();
         let chunk_hidden = if needs_mtp_history {
             let chunk_hidden =
@@ -1634,8 +1661,35 @@ fn extend_prompt_state_chunked(
     needs_mtp_history: bool,
 ) -> Result<()> {
     let _ = request;
+    let mut consumed_tokens = 0_usize;
     for (chunk_index, chunk) in suffix.chunks(prefill_chunk_tokens()).enumerate() {
         check_kill_switch("prefill_suffix_chunk_before")?;
+        let is_last_chunk = consumed_tokens + chunk.len() == suffix.len();
+        consumed_tokens += chunk.len();
+
+        if !needs_mtp_history && !is_last_chunk {
+            session
+                .qwen
+                .decode_tokens_cache_only(chunk, &session.plan, state)?;
+            state.clear_transient_block_states();
+            eval_decode_state(state)?;
+            clear_mlx_cache();
+
+            if memory_trace_enabled() {
+                log_memory_sample(
+                    "infer",
+                    "prefill_suffix_chunk_cache_only",
+                    &format!(
+                        "chunk_index={chunk_index} chunk_tokens={} position={}",
+                        chunk.len(),
+                        state.position
+                    ),
+                );
+            }
+            check_kill_switch("prefill_suffix_chunk_after")?;
+            continue;
+        }
+
         let previous_hidden = hidden.clone();
         let chunk_hidden = if needs_mtp_history {
             let chunk_hidden = session
