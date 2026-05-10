@@ -1,0 +1,1 @@
+Create a compact single-file HTML5 Canvas Flappy Bird game. Draw visuals procedurally, include physics, score, restart, and no prose.
