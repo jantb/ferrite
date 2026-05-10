@@ -18,6 +18,7 @@ anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 dirs = "6"
 inquire = "0.7"
+libc = "0.2"
 mlx-rs = { version = "0.25.3", features = ["safetensors"], optional = true }
 mlx-sys = { version = "=0.2.0", optional = true }
 rand = "0.9.4"

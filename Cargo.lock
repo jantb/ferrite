@@ -493,6 +493,7 @@ dependencies = [
  "clap",
  "dirs",
  "inquire",
+ "libc",
  "mlx-rs",
  "mlx-sys",
  "rand",

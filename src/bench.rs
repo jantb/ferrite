@@ -107,6 +107,7 @@ pub fn run_native_microbench(
         top_k: 1,
         depth: 0,
         mtp: false,
+        requested_context_tokens: None,
         profile_timings: false,
     };
     let prompt_ids = model.encode_prompt(&request)?;
@@ -212,6 +213,7 @@ pub fn run_decode_bench(
         top_k: sampling.top_k,
         depth: 0,
         mtp: false,
+        requested_context_tokens: None,
         profile_timings: false,
     };
     let prompt_ids = model.encode_prompt(&request)?;
@@ -342,6 +344,7 @@ pub fn run_mtp_bench(
         top_k: 1,
         depth,
         mtp: true,
+        requested_context_tokens: None,
         profile_timings: false,
     };
     let prompt_ids = model.encode_prompt(&request)?;
@@ -524,6 +527,7 @@ pub fn run_context_probe(
         top_k: sampling.top_k,
         depth: 0,
         mtp: false,
+        requested_context_tokens: None,
         profile_timings: false,
     };
     let source_prompt_ids = model.encode_prompt(&seed_request)?;

@@ -72,6 +72,7 @@ impl ChatCompletionRequest {
             top_k: self.top_k.unwrap_or(20),
             depth: 2,
             mtp: self.generation_mode.as_deref() != Some("ar"),
+            requested_context_tokens: None,
             profile_timings: false,
         }
     }
@@ -95,6 +96,7 @@ impl CompletionRequest {
             top_k: self.top_k.unwrap_or(20),
             depth: 2,
             mtp: true,
+            requested_context_tokens: None,
             profile_timings: false,
         }
     }

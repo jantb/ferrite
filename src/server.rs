@@ -82,7 +82,7 @@ impl OllamaChatRequest {
         public_model_id: &str,
     ) -> crate::inference::InferenceRequest {
         let options = self.options.unwrap_or_default();
-        let _requested_num_ctx = options.num_ctx;
+        let requested_num_ctx = options.num_ctx;
         let _think = self.think.unwrap_or(false);
         let tools_prompt = ollama_tools_prompt(self.tools.as_deref().unwrap_or(&[]));
         let messages = self
@@ -112,6 +112,7 @@ impl OllamaChatRequest {
                 _ => tools_prompt,
             });
         }
+        request.requested_context_tokens = requested_num_ctx;
         request
     }
 
@@ -1129,8 +1130,48 @@ mod tests {
             top_k: 20,
             depth: 2,
             mtp: true,
+            requested_context_tokens: None,
             profile_timings: false,
         };
+
+        bound_ollama_tool_request(&mut request);
+
+        assert_eq!(request.max_tokens, Some(OLLAMA_TOOL_MAX_TOKENS));
+        assert_eq!(request.stop, vec![TOOL_CALL_CLOSE.to_string()]);
+    }
+
+    #[test]
+    fn agent_shaped_hi_request_records_num_ctx_and_caps_tool_output() {
+        let parsed: OllamaChatRequest = serde_json::from_value(json!({
+            "model": "ferrite-qwen36-27b-optimized-speed",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "read_file",
+                    "description": "Read a file",
+                    "parameters": {"type": "object"}
+                }
+            }],
+            "stream": true,
+            "think": false,
+            "options": {
+                "temperature": 0.35,
+                "top_p": 0.9,
+                "top_k": 40,
+                "num_predict": 4096,
+                "num_ctx": 65536
+            }
+        }))
+        .unwrap();
+
+        assert!(parsed.has_tools());
+        let mut request = parsed.into_inference("local/model", "public-model");
+        assert_eq!(request.requested_context_tokens, Some(65_536));
+        assert_eq!(request.max_tokens, Some(4096));
+        assert_eq!(request.messages.len(), 1);
+        assert_eq!(request.messages[0].content, "hi");
+        assert!(request.system.as_deref().unwrap_or("").contains("<tools>"));
 
         bound_ollama_tool_request(&mut request);
 

@@ -1,5 +1,11 @@
 #[cfg(feature = "native-mlx")]
 use std::cell::RefCell;
+#[cfg(feature = "native-mlx")]
+use std::io::Write;
+#[cfg(feature = "native-mlx")]
+use std::path::{Path, PathBuf};
+#[cfg(feature = "native-mlx")]
+use std::sync::Once;
 use std::time::Instant;
 
 use anyhow::Result;
@@ -9,6 +15,8 @@ use serde::{Deserialize, Serialize};
 
 #[cfg(feature = "native-mlx")]
 const DEFAULT_MAX_KV_CONTEXT_TOKENS: usize = 16_384;
+#[cfg(feature = "native-mlx")]
+const DEFAULT_MLX_CACHE_LIMIT_BYTES: usize = 512 * 1024 * 1024;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct InferenceRequest {
@@ -25,6 +33,8 @@ pub struct InferenceRequest {
     pub top_k: u32,
     pub depth: u32,
     pub mtp: bool,
+    #[serde(default)]
+    pub requested_context_tokens: Option<u32>,
     #[serde(default)]
     pub profile_timings: bool,
 }
@@ -148,6 +158,46 @@ struct PreparedPrompt {
     prefix_cache_tokens: usize,
 }
 
+#[cfg(feature = "native-mlx")]
+#[derive(Clone, Copy, Debug)]
+struct MemorySnapshot {
+    rss_bytes: Option<u64>,
+    mlx_active_bytes: Option<usize>,
+    mlx_cache_bytes: Option<usize>,
+    mlx_peak_bytes: Option<usize>,
+}
+
+#[cfg(feature = "native-mlx")]
+struct RequestMemoryGuard {
+    enabled: bool,
+    request_label: &'static str,
+}
+
+#[cfg(feature = "native-mlx")]
+impl RequestMemoryGuard {
+    fn new(request_label: &'static str) -> Self {
+        configure_mlx_memory_once();
+        let enabled = memory_trace_enabled();
+        if enabled {
+            log_memory_sample(request_label, "start", "");
+        }
+        Self {
+            enabled,
+            request_label,
+        }
+    }
+}
+
+#[cfg(feature = "native-mlx")]
+impl Drop for RequestMemoryGuard {
+    fn drop(&mut self) {
+        clear_mlx_cache();
+        if self.enabled {
+            log_memory_sample(self.request_label, "drop_after_clear_cache", "");
+        }
+    }
+}
+
 impl NativeMlxBackend {
     pub fn new() -> Self {
         Self {
@@ -158,6 +208,7 @@ impl NativeMlxBackend {
 
     #[cfg(feature = "native-mlx")]
     pub fn preload(&self, model_ref: &str) -> Result<f64> {
+        let _memory_guard = RequestMemoryGuard::new("preload");
         let started = Instant::now();
         let mut cache = self.cache.borrow_mut();
         let needs_load = cache
@@ -166,6 +217,9 @@ impl NativeMlxBackend {
             .unwrap_or(true);
         if needs_load {
             *cache = Some(NativeMlxSession::load(model_ref)?);
+        }
+        if memory_trace_enabled() {
+            log_memory_sample("preload", "after_load", &format!("model={model_ref}"));
         }
         Ok(started.elapsed().as_secs_f64())
     }
@@ -233,6 +287,201 @@ fn ferrite_env_var(name: &str) -> std::result::Result<String, std::env::VarError
         }
     }
     std::env::var(name)
+}
+
+#[cfg(feature = "native-mlx")]
+fn memory_trace_enabled() -> bool {
+    env_flag("MTPLX_MEMORY_TRACE", true)
+}
+
+#[cfg(feature = "native-mlx")]
+fn configure_mlx_memory_once() {
+    static CONFIGURE: Once = Once::new();
+    CONFIGURE.call_once(|| {
+        let limit = ferrite_env_var("MTPLX_MLX_CACHE_LIMIT_BYTES")
+            .ok()
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .unwrap_or(DEFAULT_MLX_CACHE_LIMIT_BYTES);
+        if limit > 0 {
+            let mut previous = 0_usize;
+            let status = unsafe { mlx_sys::mlx_set_cache_limit(&mut previous, limit) };
+            if status != 0 {
+                let _ = append_memory_log_line(
+                    "ferrite_memory phase=configure_mlx_cache_limit status=error",
+                );
+            } else if memory_trace_enabled() {
+                let _ = append_memory_log_line(&format!(
+                    "ferrite_memory phase=configure_mlx_cache_limit limit_bytes={limit} previous_bytes={previous}"
+                ));
+                if env_flag("MTPLX_MEMORY_TRACE_STDERR", false) {
+                    eprintln!(
+                        "ferrite_memory phase=configure_mlx_cache_limit limit_bytes={limit} previous_bytes={previous}"
+                    );
+                }
+            }
+        }
+    });
+}
+
+#[cfg(feature = "native-mlx")]
+fn clear_mlx_cache() {
+    let _ = unsafe { mlx_sys::mlx_clear_cache() };
+    mlx_rs::transforms::compile::clear_cache();
+}
+
+#[cfg(feature = "native-mlx")]
+fn log_memory_sample(request_label: &str, phase: &str, details: &str) {
+    let snapshot = memory_snapshot();
+    let detail_prefix = if details.is_empty() { "" } else { " " };
+    let line = format!(
+        "ferrite_memory request={request_label} phase={phase} rss_bytes={} mlx_active_bytes={} mlx_cache_bytes={} mlx_peak_bytes={}",
+        optional_u64(snapshot.rss_bytes),
+        optional_usize(snapshot.mlx_active_bytes),
+        optional_usize(snapshot.mlx_cache_bytes),
+        optional_usize(snapshot.mlx_peak_bytes),
+    );
+    let line = format!("{line}{detail_prefix}{details}");
+    if let Err(err) = append_memory_log_line(&line) {
+        eprintln!("ferrite_memory_log_error error={err}");
+    }
+    if env_flag("MTPLX_MEMORY_TRACE_STDERR", false) {
+        eprintln!("{line}");
+    }
+}
+
+#[cfg(feature = "native-mlx")]
+fn append_memory_log_line(line: &str) -> std::io::Result<()> {
+    append_memory_log_line_to(&memory_log_path(), line)
+}
+
+#[cfg(feature = "native-mlx")]
+fn append_memory_log_line_to(path: &Path, line: &str) -> std::io::Result<()> {
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    writeln!(file, "{line}")
+}
+
+#[cfg(feature = "native-mlx")]
+fn memory_log_path() -> PathBuf {
+    ferrite_env_var("MTPLX_MEMORY_LOG")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("ferrite-memory.log"))
+}
+
+#[cfg(feature = "native-mlx")]
+fn request_memory_details(
+    request: &InferenceRequest,
+    prompt_tokens: Option<usize>,
+    max_tokens: Option<u32>,
+) -> String {
+    format!(
+        "model={} requested_num_ctx={} prompt_tokens={} max_tokens={} request_max_tokens={} prefix_cache={}",
+        request.model,
+        request
+            .requested_context_tokens
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "none".to_string()),
+        prompt_tokens
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "unknown".to_string()),
+        max_tokens
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "unknown".to_string()),
+        request
+            .max_tokens
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "none".to_string()),
+        if env_flag("MTPLX_PREFIX_CACHE", false) {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    )
+}
+
+#[cfg(feature = "native-mlx")]
+fn memory_snapshot() -> MemorySnapshot {
+    MemorySnapshot {
+        rss_bytes: process_rss_bytes(),
+        mlx_active_bytes: mlx_memory_value(mlx_sys::mlx_get_active_memory),
+        mlx_cache_bytes: mlx_memory_value(mlx_sys::mlx_get_cache_memory),
+        mlx_peak_bytes: mlx_memory_value(mlx_sys::mlx_get_peak_memory),
+    }
+}
+
+#[cfg(feature = "native-mlx")]
+fn mlx_memory_value(call: unsafe extern "C" fn(*mut usize) -> i32) -> Option<usize> {
+    let mut value = 0_usize;
+    let status = unsafe { call(&mut value) };
+    (status == 0).then_some(value)
+}
+
+#[cfg(feature = "native-mlx")]
+fn process_rss_bytes() -> Option<u64> {
+    const PROC_PIDTASKINFO: libc::c_int = 4;
+    #[repr(C)]
+    #[derive(Default)]
+    struct ProcTaskInfo {
+        virtual_size: u64,
+        resident_size: u64,
+        total_user: u64,
+        total_system: u64,
+        threads_user: u64,
+        threads_system: u64,
+        policy: i32,
+        faults: i32,
+        pageins: i32,
+        cow_faults: i32,
+        messages_sent: i32,
+        messages_received: i32,
+        syscalls_mach: i32,
+        syscalls_unix: i32,
+        csw: i32,
+        threadnum: i32,
+        numrunning: i32,
+        priority: i32,
+    }
+
+    unsafe extern "C" {
+        fn proc_pidinfo(
+            pid: libc::c_int,
+            flavor: libc::c_int,
+            arg: u64,
+            buffer: *mut libc::c_void,
+            buffersize: libc::c_int,
+        ) -> libc::c_int;
+    }
+
+    let mut info = ProcTaskInfo::default();
+    let size = std::mem::size_of::<ProcTaskInfo>();
+    let written = unsafe {
+        proc_pidinfo(
+            std::process::id() as libc::c_int,
+            PROC_PIDTASKINFO,
+            0,
+            (&mut info as *mut ProcTaskInfo).cast::<libc::c_void>(),
+            size as libc::c_int,
+        )
+    };
+    (written as usize == size).then_some(info.resident_size)
+}
+
+#[cfg(feature = "native-mlx")]
+fn optional_usize(value: Option<usize>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+#[cfg(feature = "native-mlx")]
+fn optional_u64(value: Option<u64>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "unknown".to_string())
 }
 
 #[cfg(feature = "native-mlx")]
@@ -1472,6 +1721,7 @@ impl NativeMlxBackend {
         let total_started = Instant::now();
         #[cfg(feature = "native-mlx")]
         {
+            let _memory_guard = RequestMemoryGuard::new("infer");
             let load_started = Instant::now();
             let mut cache = self.cache.borrow_mut();
             let needs_load = cache
@@ -1485,12 +1735,26 @@ impl NativeMlxBackend {
                 .as_mut()
                 .ok_or_else(|| anyhow::anyhow!("native MLX model cache was not initialized"))?;
             let load_s = load_started.elapsed().as_secs_f64();
+            if memory_trace_enabled() {
+                log_memory_sample(
+                    "infer",
+                    "after_load",
+                    &request_memory_details(request, None, None),
+                );
+            }
             let prompt_ids = session.model.encode_prompt(request)?;
             let max_tokens = bounded_max_tokens(
                 prompt_ids.len(),
                 request.max_tokens.unwrap_or(1),
                 max_kv_context_tokens(),
             )?;
+            if memory_trace_enabled() {
+                log_memory_sample(
+                    "infer",
+                    "after_tokenize",
+                    &request_memory_details(request, Some(prompt_ids.len()), Some(max_tokens)),
+                );
+            }
             let eos_token_ids = session.model.eos_token_ids();
             let sampling = crate::sampling::SamplingConfig {
                 temperature: request.temperature,
@@ -1513,6 +1777,13 @@ impl NativeMlxBackend {
                 prefill_s = prepared.prefill_s;
                 prefix_cache_hit = prepared.prefix_cache_hit;
                 prefix_cache_tokens = prepared.prefix_cache_tokens;
+                if memory_trace_enabled() {
+                    log_memory_sample(
+                        "infer",
+                        "after_prefill",
+                        &request_memory_details(request, Some(prompt_ids.len()), Some(max_tokens)),
+                    );
+                }
                 if request.mtp && request.depth > 0 && session.qwen.mtp.is_some() {
                     let post_generation_cache_base = post_generation_cache_enabled()
                         .then(|| (state.clone(), hidden.clone(), mtp_history_state.clone()));
@@ -1560,6 +1831,17 @@ impl NativeMlxBackend {
                     maybe_store_chat_post_generation_cache(session, request, &text)?;
                     let _ = (session.weights.len(), session.weights.source_files.len());
                     let total_s = total_started.elapsed().as_secs_f64();
+                    if memory_trace_enabled() {
+                        log_memory_sample(
+                            "infer",
+                            "before_return_mtp",
+                            &request_memory_details(
+                                request,
+                                Some(prompt_ids.len()),
+                                Some(max_tokens),
+                            ),
+                        );
+                    }
                     return Ok(InferenceResponse {
                         text,
                         prompt_tokens: prompt_ids.len() as u32,
@@ -1587,6 +1869,17 @@ impl NativeMlxBackend {
                 let mut next = crate::sampling::next_from_logits(&logits, sampling)?;
                 if eos_token_ids.contains(&next) {
                     let total_s = total_started.elapsed().as_secs_f64();
+                    if memory_trace_enabled() {
+                        log_memory_sample(
+                            "infer",
+                            "before_return_eos",
+                            &request_memory_details(
+                                request,
+                                Some(prompt_ids.len()),
+                                Some(max_tokens),
+                            ),
+                        );
+                    }
                     return Ok(InferenceResponse {
                         text: String::new(),
                         prompt_tokens: prompt_ids.len() as u32,
@@ -1645,6 +1938,17 @@ impl NativeMlxBackend {
                     maybe_store_chat_post_generation_cache(session, request, &text)?;
                     let _ = (session.weights.len(), session.weights.source_files.len());
                     let total_s = total_started.elapsed().as_secs_f64();
+                    if memory_trace_enabled() {
+                        log_memory_sample(
+                            "infer",
+                            "before_return_stop",
+                            &request_memory_details(
+                                request,
+                                Some(prompt_ids.len()),
+                                Some(max_tokens),
+                            ),
+                        );
+                    }
                     return Ok(InferenceResponse {
                         text,
                         prompt_tokens: prompt_ids.len() as u32,
@@ -1690,6 +1994,13 @@ impl NativeMlxBackend {
             maybe_store_chat_post_generation_cache(session, request, &text)?;
             let _ = (session.weights.len(), session.weights.source_files.len());
             let total_s = total_started.elapsed().as_secs_f64();
+            if memory_trace_enabled() {
+                log_memory_sample(
+                    "infer",
+                    "before_return",
+                    &request_memory_details(request, Some(prompt_ids.len()), Some(max_tokens)),
+                );
+            }
             Ok(InferenceResponse {
                 text,
                 prompt_tokens: prompt_ids.len() as u32,
@@ -1786,5 +2097,19 @@ mod tests {
         assert_eq!(bounded_max_tokens(60, 16, 64).unwrap(), 4);
         assert_eq!(bounded_max_tokens(64, 0, 64).unwrap(), 0);
         assert!(bounded_max_tokens(64, 1, 64).is_err());
+    }
+
+    #[cfg(feature = "native-mlx")]
+    #[test]
+    fn memory_log_appends_to_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ferrite-memory.log");
+
+        append_memory_log_line_to(&path, "ferrite_memory phase=test one=1").unwrap();
+        append_memory_log_line_to(&path, "ferrite_memory phase=test two=2").unwrap();
+
+        let text = std::fs::read_to_string(path).unwrap();
+        assert!(text.contains("phase=test one=1"));
+        assert!(text.contains("phase=test two=2"));
     }
 }

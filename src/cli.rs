@@ -226,6 +226,7 @@ fn infer(args: InferArgs) -> Result<()> {
         top_k: args.top_k,
         depth: args.depth,
         mtp: !args.no_mtp,
+        requested_context_tokens: None,
         profile_timings: args.profile_timings,
     };
     let backend = crate::inference::NativeMlxBackend::new();
