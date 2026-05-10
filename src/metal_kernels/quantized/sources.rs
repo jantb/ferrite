@@ -269,12 +269,15 @@ pub(super) const SMALL_M_QMM4_SOURCE: &str = r#"
 
     uint tid   = thread_position_in_threadgroup.x;
     uint sg_id = tid / 32;
+    uint tg_m  = threadgroup_position_in_grid.x;
     uint tg_n  = threadgroup_position_in_grid.y;
 
+    int M = int(M_size);
     int K = int(K_size);
     int N = int(N_size);
     int K_by_8  = K / 8;
     int K_by_gs = K / GS;
+    int m0 = int(tg_m) * BM;
     int n0 = int(tg_n) * BN;
 
     threadgroup T B_tile[BK * BN];
@@ -319,7 +322,7 @@ pub(super) const SMALL_M_QMM4_SOURCE: &str = r#"
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         for (int ks = 0; ks < BK / BK_SUB; ++ks) {
-            simdgroup_load(a, x + k0 + ks * BK_SUB, K);
+            simdgroup_load(a, x + m0 * K + k0 + ks * BK_SUB, K);
             simdgroup_load(
               b_L, B_tile + ks * BK_SUB * BN + sg_n_off, BN
             );
@@ -337,8 +340,180 @@ pub(super) const SMALL_M_QMM4_SOURCE: &str = r#"
     c_L_T.thread_elements()[1] = T(c_L.thread_elements()[1]);
     c_R_T.thread_elements()[0] = T(c_R.thread_elements()[0]);
     c_R_T.thread_elements()[1] = T(c_R.thread_elements()[1]);
-    simdgroup_store(c_L_T, y + n0 + sg_n_off, N);
-    simdgroup_store(c_R_T, y + n0 + sg_n_off + 8, N);
+    if (m0 < M) {
+      simdgroup_store(c_L_T, y + m0 * N + n0 + sg_n_off, N);
+      simdgroup_store(c_R_T, y + m0 * N + n0 + sg_n_off + 8, N);
+    }
+"#;
+
+pub(super) const LARGE_M_QMM4_SOURCE: &str = r#"
+    using namespace metal;
+    constexpr int BM = 32;
+    constexpr int BN = 32;
+    constexpr int BK = 32;
+    constexpr int BK_SUB = 8;
+
+    uint tid   = thread_position_in_threadgroup.x;
+    uint sg_id = simdgroup_index_in_threadgroup;
+    uint tg_m  = threadgroup_position_in_grid.x;
+    uint tg_n  = threadgroup_position_in_grid.y;
+
+    int M = int(M_size);
+    int K = int(K_size);
+    int N = int(N_size);
+    int K_by_8  = K / 8;
+    int K_by_gs = K / GS;
+    int m0 = int(tg_m) * BM;
+    int n0 = int(tg_n) * BN;
+    int sg_m_off = int(sg_id / 2) * 8;
+    int sg_n_off = int(sg_id % 2) * 16;
+
+    threadgroup T B_tile[BK * BN];
+
+    simdgroup_matrix<T, 8, 8> a, b_L, b_R;
+    simdgroup_matrix<float, 8, 8> c_L =
+      simdgroup_matrix<float, 8, 8>(0.0f);
+    simdgroup_matrix<float, 8, 8> c_R =
+      simdgroup_matrix<float, 8, 8>(0.0f);
+
+    for (int k0 = 0; k0 < K; k0 += BK) {
+        if (tid < (BK / 8) * BN) {
+            int pack = int(tid);
+            int dq_k = pack / BN;
+            int dq_n = pack % BN;
+            int n_global = n0 + dq_n;
+            int k_base = k0 + dq_k * 8;
+            uint32_t packed = w_q[n_global * K_by_8 + (k_base >> 3)];
+            float s = float(scales[n_global * K_by_gs + (k_base / GS)]);
+            float b = float(biases[n_global * K_by_gs + (k_base / GS)]);
+            for (int ki = 0; ki < 8; ++ki) {
+                uint32_t nib = (packed >> (ki * 4)) & 0xFu;
+                B_tile[(dq_k * 8 + ki) * BN + dq_n] =
+                  T(float(nib) * s + b);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (int ks = 0; ks < BK / BK_SUB; ++ks) {
+            simdgroup_load(
+              a,
+              x + (m0 + sg_m_off) * K + k0 + ks * BK_SUB,
+              K
+            );
+            simdgroup_load(
+              b_L, B_tile + ks * BK_SUB * BN + sg_n_off, BN
+            );
+            simdgroup_load(
+              b_R, B_tile + ks * BK_SUB * BN + sg_n_off + 8, BN
+            );
+            simdgroup_multiply_accumulate(c_L, a, b_L, c_L);
+            simdgroup_multiply_accumulate(c_R, a, b_R, c_R);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (m0 + sg_m_off < M) {
+      simdgroup_matrix<T, 8, 8> c_L_T, c_R_T;
+      c_L_T.thread_elements()[0] = T(c_L.thread_elements()[0]);
+      c_L_T.thread_elements()[1] = T(c_L.thread_elements()[1]);
+      c_R_T.thread_elements()[0] = T(c_R.thread_elements()[0]);
+      c_R_T.thread_elements()[1] = T(c_R.thread_elements()[1]);
+      simdgroup_store(
+        c_L_T,
+        y + (m0 + sg_m_off) * N + n0 + sg_n_off,
+        N
+      );
+      simdgroup_store(
+        c_R_T,
+        y + (m0 + sg_m_off) * N + n0 + sg_n_off + 8,
+        N
+      );
+    }
+"#;
+
+pub(super) const XLARGE_M_QMM4_SOURCE: &str = r#"
+    using namespace metal;
+    constexpr int BM = 64;
+    constexpr int BN = 32;
+    constexpr int BK = 32;
+    constexpr int BK_SUB = 8;
+
+    uint tid   = thread_position_in_threadgroup.x;
+    uint sg_id = simdgroup_index_in_threadgroup;
+    uint tg_m  = threadgroup_position_in_grid.x;
+    uint tg_n  = threadgroup_position_in_grid.y;
+
+    int M = int(M_size);
+    int K = int(K_size);
+    int N = int(N_size);
+    int K_by_8  = K / 8;
+    int K_by_gs = K / GS;
+    int m0 = int(tg_m) * BM;
+    int n0 = int(tg_n) * BN;
+    int sg_m_off = int(sg_id / 2) * 8;
+    int sg_n_off = int(sg_id % 2) * 16;
+
+    threadgroup T B_tile[BK * BN];
+
+    simdgroup_matrix<T, 8, 8> a, b_L, b_R;
+    simdgroup_matrix<float, 8, 8> c_L =
+      simdgroup_matrix<float, 8, 8>(0.0f);
+    simdgroup_matrix<float, 8, 8> c_R =
+      simdgroup_matrix<float, 8, 8>(0.0f);
+
+    for (int k0 = 0; k0 < K; k0 += BK) {
+        if (tid < (BK / 8) * BN) {
+            int pack = int(tid);
+            int dq_k = pack / BN;
+            int dq_n = pack % BN;
+            int n_global = n0 + dq_n;
+            int k_base = k0 + dq_k * 8;
+            uint32_t packed = w_q[n_global * K_by_8 + (k_base >> 3)];
+            float s = float(scales[n_global * K_by_gs + (k_base / GS)]);
+            float b = float(biases[n_global * K_by_gs + (k_base / GS)]);
+            for (int ki = 0; ki < 8; ++ki) {
+                uint32_t nib = (packed >> (ki * 4)) & 0xFu;
+                B_tile[(dq_k * 8 + ki) * BN + dq_n] =
+                  T(float(nib) * s + b);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (int ks = 0; ks < BK / BK_SUB; ++ks) {
+            simdgroup_load(
+              a,
+              x + (m0 + sg_m_off) * K + k0 + ks * BK_SUB,
+              K
+            );
+            simdgroup_load(
+              b_L, B_tile + ks * BK_SUB * BN + sg_n_off, BN
+            );
+            simdgroup_load(
+              b_R, B_tile + ks * BK_SUB * BN + sg_n_off + 8, BN
+            );
+            simdgroup_multiply_accumulate(c_L, a, b_L, c_L);
+            simdgroup_multiply_accumulate(c_R, a, b_R, c_R);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (m0 + sg_m_off < M) {
+      simdgroup_matrix<T, 8, 8> c_L_T, c_R_T;
+      c_L_T.thread_elements()[0] = T(c_L.thread_elements()[0]);
+      c_L_T.thread_elements()[1] = T(c_L.thread_elements()[1]);
+      c_R_T.thread_elements()[0] = T(c_R.thread_elements()[0]);
+      c_R_T.thread_elements()[1] = T(c_R.thread_elements()[1]);
+      simdgroup_store(
+        c_L_T,
+        y + (m0 + sg_m_off) * N + n0 + sg_n_off,
+        N
+      );
+      simdgroup_store(
+        c_R_T,
+        y + (m0 + sg_m_off) * N + n0 + sg_n_off + 8,
+        N
+      );
+    }
 "#;
 
 pub(super) const SMALL_M_QMV4_SOURCE: &str = r#"

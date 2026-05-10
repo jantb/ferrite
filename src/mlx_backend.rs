@@ -105,6 +105,21 @@ impl QuantizedLinear {
                 }
             }
         }
+        if crate::metal_kernels::large_m_qmm4_enabled() {
+            if let Some(y) = crate::metal_kernels::large_m_qmm4_matmul(x, self)? {
+                return Ok(y);
+            }
+        }
+        if crate::metal_kernels::xlarge_m_qmm4_enabled() {
+            if let Some(y) = crate::metal_kernels::xlarge_m_qmm4_matmul(x, self)? {
+                return Ok(y);
+            }
+        }
+        if crate::metal_kernels::tiled_qmm4_enabled() {
+            if let Some(y) = crate::metal_kernels::tiled_qmm4_matmul(x, self)? {
+                return Ok(y);
+            }
+        }
         if crate::metal_kernels::small_m_qmm4_enabled() {
             if let Some(y) = crate::metal_kernels::small_m_qmm4_matmul(x, self)? {
                 return Ok(y);

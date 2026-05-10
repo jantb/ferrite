@@ -7,13 +7,14 @@ mod config;
 mod sources;
 use super::{OutputSpec, TemplateArg, metal_is_available};
 use cache::{
-    with_gate_up_swiglu_qmv4_kernel, with_multi3_qmv4_kernel, with_small_m_qmm4_kernel,
-    with_small_m_qmv4_kernel,
+    with_gate_up_swiglu_qmv4_kernel, with_large_m_qmm4_kernel, with_multi3_qmv4_kernel,
+    with_small_m_qmm4_kernel, with_small_m_qmv4_kernel, with_xlarge_m_qmm4_kernel,
 };
 #[cfg(test)]
 pub(super) use config::small_m_qmv4_m_values_from_str;
 pub use config::{
-    gate_up_swiglu_qmv4_enabled, small_m_qmm4_enabled, small_m_qmv4_enabled, small_m_qmv4_strict,
+    gate_up_swiglu_qmv4_enabled, large_m_qmm4_enabled, small_m_qmm4_enabled, small_m_qmv4_enabled,
+    small_m_qmv4_strict, tiled_qmm4_enabled, xlarge_m_qmm4_enabled,
 };
 use config::{
     multi3_qmv4_enabled, qmv4_packs_per_thread_or_default, qmv4_simdgroups_or_default,
@@ -188,6 +189,168 @@ pub fn small_m_qmm4_matmul(
     Ok(Some(y.reshape(&out_shape)?))
 }
 
+pub fn tiled_qmm4_matmul(
+    x: &Array,
+    linear: &crate::mlx_backend::QuantizedLinear,
+) -> Result<Option<Array>> {
+    if !tiled_qmm4_is_eligible(x, linear) {
+        return Ok(None);
+    }
+
+    let shape = x.shape().to_vec();
+    let m = shape[shape.len() - 2];
+    let k = shape[shape.len() - 1];
+    let n = linear.weight.shape()[0];
+    let x2 = x.reshape(&[m, k])?;
+    let m_arg = Array::from_int(m);
+    let k_arg = Array::from_int(k);
+    let n_arg = Array::from_int(n);
+    let m_tiles = m / 8;
+    let outputs = with_small_m_qmm4_kernel(x.dtype(), |kernel| {
+        kernel.apply(
+            &[
+                &x2,
+                &linear.weight,
+                &linear.scales,
+                &linear.biases,
+                &m_arg,
+                &k_arg,
+                &n_arg,
+            ],
+            &[OutputSpec {
+                shape: &[m, n],
+                dtype: x.dtype(),
+            }],
+            &[
+                TemplateArg::Dtype("T", x.dtype()),
+                TemplateArg::Int("GS", linear.group_size),
+            ],
+            (64 * m_tiles, n / 32, 1),
+            (64, 1, 1),
+            &Stream::gpu(),
+        )
+    })?;
+    let [mut y]: [Array; 1] = outputs
+        .try_into()
+        .map_err(|_| anyhow!("tiled qmm4 kernel returned wrong output count"))?;
+    if let Some(bias) = &linear.bias {
+        y = y.add(bias)?;
+    }
+    let mut out_shape = shape;
+    if let Some(last) = out_shape.last_mut() {
+        *last = n;
+    }
+    Ok(Some(y.reshape(&out_shape)?))
+}
+
+pub fn large_m_qmm4_matmul(
+    x: &Array,
+    linear: &crate::mlx_backend::QuantizedLinear,
+) -> Result<Option<Array>> {
+    if !large_m_qmm4_is_eligible(x, linear) {
+        return Ok(None);
+    }
+
+    let shape = x.shape().to_vec();
+    let m = shape[shape.len() - 2];
+    let k = shape[shape.len() - 1];
+    let n = linear.weight.shape()[0];
+    let x2 = x.reshape(&[m, k])?;
+    let m_arg = Array::from_int(m);
+    let k_arg = Array::from_int(k);
+    let n_arg = Array::from_int(n);
+    let m_tiles = m / 32;
+    let outputs = with_large_m_qmm4_kernel(x.dtype(), |kernel| {
+        kernel.apply(
+            &[
+                &x2,
+                &linear.weight,
+                &linear.scales,
+                &linear.biases,
+                &m_arg,
+                &k_arg,
+                &n_arg,
+            ],
+            &[OutputSpec {
+                shape: &[m, n],
+                dtype: x.dtype(),
+            }],
+            &[
+                TemplateArg::Dtype("T", x.dtype()),
+                TemplateArg::Int("GS", linear.group_size),
+            ],
+            (256 * m_tiles, n / 32, 1),
+            (256, 1, 1),
+            &Stream::gpu(),
+        )
+    })?;
+    let [mut y]: [Array; 1] = outputs
+        .try_into()
+        .map_err(|_| anyhow!("large-m qmm4 kernel returned wrong output count"))?;
+    if let Some(bias) = &linear.bias {
+        y = y.add(bias)?;
+    }
+    let mut out_shape = shape;
+    if let Some(last) = out_shape.last_mut() {
+        *last = n;
+    }
+    Ok(Some(y.reshape(&out_shape)?))
+}
+
+pub fn xlarge_m_qmm4_matmul(
+    x: &Array,
+    linear: &crate::mlx_backend::QuantizedLinear,
+) -> Result<Option<Array>> {
+    if !xlarge_m_qmm4_is_eligible(x, linear) {
+        return Ok(None);
+    }
+
+    let shape = x.shape().to_vec();
+    let m = shape[shape.len() - 2];
+    let k = shape[shape.len() - 1];
+    let n = linear.weight.shape()[0];
+    let x2 = x.reshape(&[m, k])?;
+    let m_arg = Array::from_int(m);
+    let k_arg = Array::from_int(k);
+    let n_arg = Array::from_int(n);
+    let m_tiles = m / 64;
+    let outputs = with_xlarge_m_qmm4_kernel(x.dtype(), |kernel| {
+        kernel.apply(
+            &[
+                &x2,
+                &linear.weight,
+                &linear.scales,
+                &linear.biases,
+                &m_arg,
+                &k_arg,
+                &n_arg,
+            ],
+            &[OutputSpec {
+                shape: &[m, n],
+                dtype: x.dtype(),
+            }],
+            &[
+                TemplateArg::Dtype("T", x.dtype()),
+                TemplateArg::Int("GS", linear.group_size),
+            ],
+            (512 * m_tiles, n / 32, 1),
+            (512, 1, 1),
+            &Stream::gpu(),
+        )
+    })?;
+    let [mut y]: [Array; 1] = outputs
+        .try_into()
+        .map_err(|_| anyhow!("xlarge-m qmm4 kernel returned wrong output count"))?;
+    if let Some(bias) = &linear.bias {
+        y = y.add(bias)?;
+    }
+    let mut out_shape = shape;
+    if let Some(last) = out_shape.last_mut() {
+        *last = n;
+    }
+    Ok(Some(y.reshape(&out_shape)?))
+}
+
 pub fn small_m_qmv4_matmul(
     x: &Array,
     linear: &crate::mlx_backend::QuantizedLinear,
@@ -296,6 +459,108 @@ fn small_m_qmm4_is_eligible(x: &Array, linear: &crate::mlx_backend::QuantizedLin
     }
     let m = shape[shape.len() - 2];
     if !(2..=8).contains(&m) {
+        return false;
+    }
+    let leading_batch = shape[..shape.len() - 2].iter().copied().product::<i32>();
+    if leading_batch != 1 {
+        return false;
+    }
+    let k = shape[shape.len() - 1];
+    let weight_shape = linear.weight.shape();
+    if weight_shape.len() != 2 {
+        return false;
+    }
+    let n = weight_shape[0];
+    k == weight_shape[1] * 8 && k % 32 == 0 && n % 32 == 0
+}
+
+fn tiled_qmm4_is_eligible(x: &Array, linear: &crate::mlx_backend::QuantizedLinear) -> bool {
+    if !tiled_qmm4_enabled() || !metal_is_available() {
+        return false;
+    }
+    if linear.bits != 4 || !matches!(linear.group_size, 32 | 64 | 128) {
+        return false;
+    }
+    if !matches!(x.dtype(), Dtype::Bfloat16 | Dtype::Float16) {
+        return false;
+    }
+    if linear.scales.dtype() != x.dtype() || linear.biases.dtype() != x.dtype() {
+        return false;
+    }
+    let shape = x.shape();
+    if shape.len() < 2 {
+        return false;
+    }
+    let m = shape[shape.len() - 2];
+    if !(8..=128).contains(&m) || m % 8 != 0 {
+        return false;
+    }
+    let leading_batch = shape[..shape.len() - 2].iter().copied().product::<i32>();
+    if leading_batch != 1 {
+        return false;
+    }
+    let k = shape[shape.len() - 1];
+    let weight_shape = linear.weight.shape();
+    if weight_shape.len() != 2 {
+        return false;
+    }
+    let n = weight_shape[0];
+    k == weight_shape[1] * 8 && k % 32 == 0 && n % 32 == 0
+}
+
+fn large_m_qmm4_is_eligible(x: &Array, linear: &crate::mlx_backend::QuantizedLinear) -> bool {
+    if !large_m_qmm4_enabled() || !metal_is_available() {
+        return false;
+    }
+    if linear.bits != 4 || !matches!(linear.group_size, 32 | 64 | 128) {
+        return false;
+    }
+    if !matches!(x.dtype(), Dtype::Bfloat16 | Dtype::Float16) {
+        return false;
+    }
+    if linear.scales.dtype() != x.dtype() || linear.biases.dtype() != x.dtype() {
+        return false;
+    }
+    let shape = x.shape();
+    if shape.len() < 2 {
+        return false;
+    }
+    let m = shape[shape.len() - 2];
+    if !(32..=128).contains(&m) || m % 32 != 0 {
+        return false;
+    }
+    let leading_batch = shape[..shape.len() - 2].iter().copied().product::<i32>();
+    if leading_batch != 1 {
+        return false;
+    }
+    let k = shape[shape.len() - 1];
+    let weight_shape = linear.weight.shape();
+    if weight_shape.len() != 2 {
+        return false;
+    }
+    let n = weight_shape[0];
+    k == weight_shape[1] * 8 && k % 32 == 0 && n % 32 == 0
+}
+
+fn xlarge_m_qmm4_is_eligible(x: &Array, linear: &crate::mlx_backend::QuantizedLinear) -> bool {
+    if !xlarge_m_qmm4_enabled() || !metal_is_available() {
+        return false;
+    }
+    if linear.bits != 4 || !matches!(linear.group_size, 32 | 64 | 128) {
+        return false;
+    }
+    if !matches!(x.dtype(), Dtype::Bfloat16 | Dtype::Float16) {
+        return false;
+    }
+    if linear.scales.dtype() != x.dtype() || linear.biases.dtype() != x.dtype() {
+        return false;
+    }
+    let shape = x.shape();
+    if shape.len() < 2 {
+        return false;
+    }
+    let m = shape[shape.len() - 2];
+    if !(64..=128).contains(&m) || m % 64 != 0 {
         return false;
     }
     let leading_batch = shape[..shape.len() - 2].iter().copied().product::<i32>();

@@ -9,6 +9,21 @@ pub fn small_m_qmm4_enabled() -> bool {
     *ENABLED.get_or_init(|| env_flag("MTPLX_SMALL_M_QMM4", false))
 }
 
+pub fn tiled_qmm4_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env_flag("FERRITE_TILED_QMM4", false))
+}
+
+pub fn large_m_qmm4_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env_flag("FERRITE_LARGE_M_QMM4", false))
+}
+
+pub fn xlarge_m_qmm4_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env_flag("FERRITE_XLARGE_M_QMM4", false))
+}
+
 pub fn small_m_qmv4_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| env_flag("FERRITE_SMALL_M_QMV4", true))

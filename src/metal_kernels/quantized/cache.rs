@@ -5,8 +5,9 @@ use mlx_rs::Dtype;
 
 use super::super::MetalKernel;
 use super::sources::{
-    GATE_UP_SWIGLU_QMV4_HEADER, GATE_UP_SWIGLU_QMV4_SOURCE, MULTI3_QMV4_HEADER, MULTI3_QMV4_SOURCE,
-    SMALL_M_QMM4_SOURCE, SMALL_M_QMV4_HEADER, SMALL_M_QMV4_SOURCE,
+    GATE_UP_SWIGLU_QMV4_HEADER, GATE_UP_SWIGLU_QMV4_SOURCE, LARGE_M_QMM4_SOURCE,
+    MULTI3_QMV4_HEADER, MULTI3_QMV4_SOURCE, SMALL_M_QMM4_SOURCE, SMALL_M_QMV4_HEADER,
+    SMALL_M_QMV4_SOURCE, XLARGE_M_QMM4_SOURCE,
 };
 
 thread_local! {
@@ -14,6 +15,10 @@ thread_local! {
     static GATE_UP_SWIGLU_QMV4_F16: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
     static SMALL_M_QMM4_BF16: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
     static SMALL_M_QMM4_F16: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
+    static LARGE_M_QMM4_BF16: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
+    static LARGE_M_QMM4_F16: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
+    static XLARGE_M_QMM4_BF16: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
+    static XLARGE_M_QMM4_F16: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
     static SMALL_M_QMV4_BF16: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
     static SMALL_M_QMV4_F16: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
     static MULTI3_QMV4_BF16: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
@@ -82,6 +87,80 @@ pub(super) fn with_small_m_qmm4_kernel<T>(
         Dtype::Float16 => SMALL_M_QMM4_F16.with(|slot| with_cached_small_m_kernel(slot, dtype, f)),
         other => bail!("small-m qmm4 does not support dtype {other:?}"),
     }
+}
+
+pub(super) fn with_large_m_qmm4_kernel<T>(
+    dtype: Dtype,
+    f: impl FnOnce(&MetalKernel) -> Result<T>,
+) -> Result<T> {
+    match dtype {
+        Dtype::Bfloat16 => {
+            LARGE_M_QMM4_BF16.with(|slot| with_cached_large_m_kernel(slot, dtype, f))
+        }
+        Dtype::Float16 => LARGE_M_QMM4_F16.with(|slot| with_cached_large_m_kernel(slot, dtype, f)),
+        other => bail!("large-m qmm4 does not support dtype {other:?}"),
+    }
+}
+
+pub(super) fn with_xlarge_m_qmm4_kernel<T>(
+    dtype: Dtype,
+    f: impl FnOnce(&MetalKernel) -> Result<T>,
+) -> Result<T> {
+    match dtype {
+        Dtype::Bfloat16 => {
+            XLARGE_M_QMM4_BF16.with(|slot| with_cached_xlarge_m_kernel(slot, dtype, f))
+        }
+        Dtype::Float16 => {
+            XLARGE_M_QMM4_F16.with(|slot| with_cached_xlarge_m_kernel(slot, dtype, f))
+        }
+        other => bail!("xlarge-m qmm4 does not support dtype {other:?}"),
+    }
+}
+
+fn with_cached_xlarge_m_kernel<T>(
+    slot: &RefCell<Option<MetalKernel>>,
+    dtype: Dtype,
+    f: impl FnOnce(&MetalKernel) -> Result<T>,
+) -> Result<T> {
+    if slot.borrow().is_none() {
+        let name = match dtype {
+            Dtype::Bfloat16 => "mtplx_rs_xlarge_m_qmm4_bf16",
+            Dtype::Float16 => "mtplx_rs_xlarge_m_qmm4_f16",
+            other => bail!("xlarge-m qmm4 does not support dtype {other:?}"),
+        };
+        *slot.borrow_mut() = Some(MetalKernel::new(
+            name,
+            &["x", "w_q", "scales", "biases", "M_size", "K_size", "N_size"],
+            &["y"],
+            XLARGE_M_QMM4_SOURCE,
+            "",
+        )?);
+    }
+    let kernel = slot.borrow();
+    f(kernel.as_ref().expect("xlarge-m qmm4 kernel initialized"))
+}
+
+fn with_cached_large_m_kernel<T>(
+    slot: &RefCell<Option<MetalKernel>>,
+    dtype: Dtype,
+    f: impl FnOnce(&MetalKernel) -> Result<T>,
+) -> Result<T> {
+    if slot.borrow().is_none() {
+        let name = match dtype {
+            Dtype::Bfloat16 => "mtplx_rs_large_m_qmm4_bf16",
+            Dtype::Float16 => "mtplx_rs_large_m_qmm4_f16",
+            other => bail!("large-m qmm4 does not support dtype {other:?}"),
+        };
+        *slot.borrow_mut() = Some(MetalKernel::new(
+            name,
+            &["x", "w_q", "scales", "biases", "M_size", "K_size", "N_size"],
+            &["y"],
+            LARGE_M_QMM4_SOURCE,
+            "",
+        )?);
+    }
+    let kernel = slot.borrow();
+    f(kernel.as_ref().expect("large-m qmm4 kernel initialized"))
 }
 
 fn with_cached_small_m_kernel<T>(

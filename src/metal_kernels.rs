@@ -11,8 +11,10 @@ use mlx_rs::{Array, Dtype, Stream};
 pub use gdn::LinearGdnKernels;
 pub(crate) use quantized::small_m_qmv4_matmul_for_bench;
 pub use quantized::{
-    gate_up_swiglu_qmv4_activation, gate_up_swiglu_qmv4_enabled, small_m_qmm4_enabled,
-    small_m_qmm4_matmul, small_m_qmv4_enabled, small_m_qmv4_matmul, small_m_qmv4_strict,
+    gate_up_swiglu_qmv4_activation, gate_up_swiglu_qmv4_enabled, large_m_qmm4_enabled,
+    large_m_qmm4_matmul, small_m_qmm4_enabled, small_m_qmm4_matmul, small_m_qmv4_enabled,
+    small_m_qmv4_matmul, small_m_qmv4_strict, tiled_qmm4_enabled, tiled_qmm4_matmul,
+    xlarge_m_qmm4_enabled, xlarge_m_qmm4_matmul,
 };
 
 const SUCCESS: i32 = 0;
@@ -484,6 +486,204 @@ mod tests {
             }
         }
 
+        Ok(())
+    }
+
+    #[test]
+    fn tiled_qmm4_matches_quantized_matmul() -> Result<()> {
+        if std::env::var_os("FERRITE_RUN_METAL_TESTS").is_none() {
+            return Ok(());
+        }
+        let _guard = crate::mlx_test_lock();
+        if std::env::var_os("MAKELEVEL").is_some() {
+            return Ok(());
+        }
+        if !metal_is_available() {
+            return Ok(());
+        }
+
+        let m = 16;
+        let k = 512;
+        let n = 64;
+        let group_size = 128;
+        let dense_w_values = (0..(n * k))
+            .map(|idx| (((idx * 19 + 5) % 43) as f32 - 21.0) / 23.0)
+            .collect::<Vec<_>>();
+        let dense_w = Array::from_slice(&dense_w_values, &[n, k]).as_dtype(Dtype::Bfloat16)?;
+        let (weight, scales, biases) = mlx_rs::ops::quantize(&dense_w, group_size, 4)?;
+        weight.eval()?;
+        scales.eval()?;
+        biases.eval()?;
+        let linear = crate::mlx_backend::QuantizedLinear {
+            weight,
+            scales,
+            biases,
+            bias: None,
+            group_size,
+            bits: 4,
+        };
+        let x_values = (0..(m * k))
+            .map(|idx| (((idx * 13 + 7) % 37) as f32 - 18.0) / 19.0)
+            .collect::<Vec<_>>();
+        let x = Array::from_slice(&x_values, &[m, k]).as_dtype(Dtype::Bfloat16)?;
+        let expected = mlx_rs::ops::quantized_matmul(
+            &x,
+            &linear.weight,
+            &linear.scales,
+            &linear.biases,
+            true,
+            group_size,
+            4,
+        )?
+        .as_dtype(Dtype::Float32)?;
+        let actual = tiled_qmm4_matmul(&x, &linear)?
+            .expect("tiled qmm4 should be eligible")
+            .as_dtype(Dtype::Float32)?;
+        expected.eval()?;
+        actual.eval()?;
+
+        let expected = expected.as_slice::<f32>();
+        let actual = actual.as_slice::<f32>();
+        assert_eq!(actual.len(), expected.len());
+        for (idx, (actual, expected)) in actual.iter().zip(expected.iter()).enumerate() {
+            let diff = (actual - expected).abs();
+            assert!(
+                diff <= 0.125,
+                "idx={idx} actual={actual} expected={expected} diff={diff}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn large_m_qmm4_matches_quantized_matmul() -> Result<()> {
+        if std::env::var_os("FERRITE_RUN_METAL_TESTS").is_none() {
+            return Ok(());
+        }
+        let _guard = crate::mlx_test_lock();
+        if std::env::var_os("MAKELEVEL").is_some() {
+            return Ok(());
+        }
+        if !metal_is_available() {
+            return Ok(());
+        }
+
+        let m = 32;
+        let k = 512;
+        let n = 64;
+        let group_size = 128;
+        let dense_w_values = (0..(n * k))
+            .map(|idx| (((idx * 19 + 5) % 43) as f32 - 21.0) / 23.0)
+            .collect::<Vec<_>>();
+        let dense_w = Array::from_slice(&dense_w_values, &[n, k]).as_dtype(Dtype::Bfloat16)?;
+        let (weight, scales, biases) = mlx_rs::ops::quantize(&dense_w, group_size, 4)?;
+        weight.eval()?;
+        scales.eval()?;
+        biases.eval()?;
+        let linear = crate::mlx_backend::QuantizedLinear {
+            weight,
+            scales,
+            biases,
+            bias: None,
+            group_size,
+            bits: 4,
+        };
+        let x_values = (0..(m * k))
+            .map(|idx| (((idx * 13 + 7) % 37) as f32 - 18.0) / 19.0)
+            .collect::<Vec<_>>();
+        let x = Array::from_slice(&x_values, &[m, k]).as_dtype(Dtype::Bfloat16)?;
+        let expected = mlx_rs::ops::quantized_matmul(
+            &x,
+            &linear.weight,
+            &linear.scales,
+            &linear.biases,
+            true,
+            group_size,
+            4,
+        )?
+        .as_dtype(Dtype::Float32)?;
+        let actual = large_m_qmm4_matmul(&x, &linear)?
+            .expect("large-m qmm4 should be eligible")
+            .as_dtype(Dtype::Float32)?;
+        expected.eval()?;
+        actual.eval()?;
+
+        let expected = expected.as_slice::<f32>();
+        let actual = actual.as_slice::<f32>();
+        assert_eq!(actual.len(), expected.len());
+        for (idx, (actual, expected)) in actual.iter().zip(expected.iter()).enumerate() {
+            let diff = (actual - expected).abs();
+            assert!(
+                diff <= 0.125,
+                "idx={idx} actual={actual} expected={expected} diff={diff}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn xlarge_m_qmm4_matches_quantized_matmul() -> Result<()> {
+        if std::env::var_os("FERRITE_RUN_METAL_TESTS").is_none() {
+            return Ok(());
+        }
+        let _guard = crate::mlx_test_lock();
+        if std::env::var_os("MAKELEVEL").is_some() {
+            return Ok(());
+        }
+        if !metal_is_available() {
+            return Ok(());
+        }
+
+        let m = 64;
+        let k = 512;
+        let n = 64;
+        let group_size = 128;
+        let dense_w_values = (0..(n * k))
+            .map(|idx| (((idx * 19 + 5) % 43) as f32 - 21.0) / 23.0)
+            .collect::<Vec<_>>();
+        let dense_w = Array::from_slice(&dense_w_values, &[n, k]).as_dtype(Dtype::Bfloat16)?;
+        let (weight, scales, biases) = mlx_rs::ops::quantize(&dense_w, group_size, 4)?;
+        weight.eval()?;
+        scales.eval()?;
+        biases.eval()?;
+        let linear = crate::mlx_backend::QuantizedLinear {
+            weight,
+            scales,
+            biases,
+            bias: None,
+            group_size,
+            bits: 4,
+        };
+        let x_values = (0..(m * k))
+            .map(|idx| (((idx * 13 + 7) % 37) as f32 - 18.0) / 19.0)
+            .collect::<Vec<_>>();
+        let x = Array::from_slice(&x_values, &[m, k]).as_dtype(Dtype::Bfloat16)?;
+        let expected = mlx_rs::ops::quantized_matmul(
+            &x,
+            &linear.weight,
+            &linear.scales,
+            &linear.biases,
+            true,
+            group_size,
+            4,
+        )?
+        .as_dtype(Dtype::Float32)?;
+        let actual = xlarge_m_qmm4_matmul(&x, &linear)?
+            .expect("xlarge-m qmm4 should be eligible")
+            .as_dtype(Dtype::Float32)?;
+        expected.eval()?;
+        actual.eval()?;
+
+        let expected = expected.as_slice::<f32>();
+        let actual = actual.as_slice::<f32>();
+        assert_eq!(actual.len(), expected.len());
+        for (idx, (actual, expected)) in actual.iter().zip(expected.iter()).enumerate() {
+            let diff = (actual - expected).abs();
+            assert!(
+                diff <= 0.125,
+                "idx={idx} actual={actual} expected={expected} diff={diff}"
+            );
+        }
         Ok(())
     }
 
