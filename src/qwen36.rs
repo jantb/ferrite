@@ -187,11 +187,14 @@ pub struct DecodeProfileTimings {
 }
 
 #[cfg(feature = "native-mlx")]
+mod full_attention;
+#[cfg(feature = "native-mlx")]
+pub use full_attention::{FullAttentionProjection, FullAttentionWeights};
+#[cfg(feature = "native-mlx")]
 mod layers;
 #[cfg(feature = "native-mlx")]
 pub use layers::{
-    AttentionWeights, FullAttentionProjection, FullAttentionWeights, LayerWeights,
-    LinearAttentionProjection, LinearAttentionWeights,
+    AttentionWeights, LayerWeights, LinearAttentionProjection, LinearAttentionWeights,
 };
 #[cfg(feature = "native-mlx")]
 mod mlp;
