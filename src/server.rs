@@ -9,6 +9,11 @@ use serde_json::json;
 use crate::api::{self, ChatCompletionRequest, CompletionRequest};
 use crate::inference::{InferenceBackend, NativeMlxBackend};
 
+const OLLAMA_TOOL_MAX_TOKENS: u32 = 1024;
+const TOOL_CALL_OPEN: &str = "<tool_call>";
+const TOOL_CALL_CLOSE: &str = "</tool_call>";
+const MAX_BUFFERED_TOOL_CALL_CHARS: usize = 64 * 1024;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ServerConfig {
     pub model: String,
@@ -267,9 +272,16 @@ fn handle_connection(
                 .unwrap_or_else(|| config.model_id.clone());
             let wants_stream = parsed.stream.unwrap_or(true);
             let has_tools = parsed.has_tools();
-            let request = parsed.into_inference(&config.model, &config.model_id);
+            let mut request = parsed.into_inference(&config.model, &config.model_id);
+            if has_tools {
+                bound_ollama_tool_request(&mut request);
+            }
             if wants_stream && request.stop.is_empty() && !has_tools {
                 write_ollama_chat_stream(&mut stream, backend, &request, &response_model)?;
+                return Ok(());
+            }
+            if wants_stream && has_tools {
+                write_ollama_tool_chat_stream(&mut stream, backend, &request, &response_model)?;
                 return Ok(());
             }
             match backend.infer(&request) {
@@ -513,6 +525,75 @@ fn write_ollama_chat_stream(
     Ok(())
 }
 
+fn write_ollama_tool_chat_stream(
+    stream: &mut TcpStream,
+    backend: &NativeMlxBackend,
+    request: &crate::inference::InferenceRequest,
+    model: &str,
+) -> Result<()> {
+    write_ndjson_headers(stream)?;
+    let mut filter = OllamaToolStreamFilter::new();
+    let result = backend.infer_stream(request, |delta| {
+        for event in filter.feed(delta) {
+            write_ollama_stream_event(stream, model, event)?;
+        }
+        Ok(())
+    });
+    for event in filter.flush() {
+        write_ollama_stream_event(stream, model, event)?;
+    }
+    match result {
+        Ok(response) => write_json_line(
+            stream,
+            &json!({
+                "model": model,
+                "created_at": iso_time(),
+                "message": {"role": "assistant", "content": ""},
+                "done_reason": ollama_done_reason(&response.finish_reason),
+                "done": true,
+                "prompt_eval_count": response.prompt_tokens,
+                "eval_count": response.completion_tokens
+            }),
+        )?,
+        Err(err) => write_json_line(
+            stream,
+            &json!({
+                "error": err.to_string(),
+                "done": true
+            }),
+        )?,
+    }
+    Ok(())
+}
+
+fn write_ollama_stream_event(
+    stream: &mut TcpStream,
+    model: &str,
+    event: OllamaStreamEvent,
+) -> Result<()> {
+    match event {
+        OllamaStreamEvent::Text(text) if text.is_empty() => Ok(()),
+        OllamaStreamEvent::Text(text) => write_json_line(
+            stream,
+            &json!({
+                "model": model,
+                "created_at": iso_time(),
+                "message": {"role": "assistant", "content": text},
+                "done": false
+            }),
+        ),
+        OllamaStreamEvent::ToolCall(call) => write_json_line(
+            stream,
+            &json!({
+                "model": model,
+                "created_at": iso_time(),
+                "message": {"role": "assistant", "content": "", "tool_calls": [call]},
+                "done": false
+            }),
+        ),
+    }
+}
+
 fn write_ollama_chat_compat_stream(
     stream: &mut TcpStream,
     model: &str,
@@ -697,6 +778,18 @@ fn write_json_line<T: Serialize>(stream: &mut TcpStream, value: &T) -> Result<()
     Ok(())
 }
 
+fn bound_ollama_tool_request(request: &mut crate::inference::InferenceRequest) {
+    request.max_tokens = Some(
+        request
+            .max_tokens
+            .unwrap_or(OLLAMA_TOOL_MAX_TOKENS)
+            .min(OLLAMA_TOOL_MAX_TOKENS),
+    );
+    if !request.stop.iter().any(|stop| stop == TOOL_CALL_CLOSE) {
+        request.stop.push(TOOL_CALL_CLOSE.to_string());
+    }
+}
+
 fn ollama_message_role(role: &str) -> &str {
     if role == "tool" { "user" } else { role }
 }
@@ -746,14 +839,109 @@ fn ollama_tools_prompt(tools: &[OllamaTool]) -> Option<String> {
     Some(out)
 }
 
+enum OllamaStreamEvent {
+    Text(String),
+    ToolCall(OllamaToolCall),
+}
+
+struct OllamaToolStreamFilter {
+    buffered: String,
+    in_tool_call: bool,
+}
+
+impl OllamaToolStreamFilter {
+    fn new() -> Self {
+        Self {
+            buffered: String::new(),
+            in_tool_call: false,
+        }
+    }
+
+    fn feed(&mut self, delta: &str) -> Vec<OllamaStreamEvent> {
+        self.buffered.push_str(delta);
+        let mut events = Vec::new();
+        loop {
+            if self.in_tool_call {
+                if let Some(close) = self.buffered.find(TOOL_CALL_CLOSE) {
+                    let body = self.buffered[..close].trim().to_string();
+                    self.buffered.drain(..close + TOOL_CALL_CLOSE.len());
+                    self.in_tool_call = false;
+                    if let Ok(value) = serde_json::from_str::<serde_json::Value>(&body) {
+                        if let Some(call) = ollama_tool_call_from_value(value) {
+                            events.push(OllamaStreamEvent::ToolCall(call));
+                            continue;
+                        }
+                    }
+                    events.push(OllamaStreamEvent::Text(format!(
+                        "{TOOL_CALL_OPEN}{body}{TOOL_CALL_CLOSE}"
+                    )));
+                    continue;
+                }
+                if self.buffered.len() > MAX_BUFFERED_TOOL_CALL_CHARS {
+                    events.push(OllamaStreamEvent::Text(format!(
+                        "{TOOL_CALL_OPEN}{}",
+                        self.buffered
+                    )));
+                    self.buffered.clear();
+                    self.in_tool_call = false;
+                }
+                break;
+            }
+
+            if let Some(open) = self.buffered.find(TOOL_CALL_OPEN) {
+                if open > 0 {
+                    events.push(OllamaStreamEvent::Text(self.buffered[..open].to_string()));
+                }
+                self.buffered.drain(..open + TOOL_CALL_OPEN.len());
+                self.in_tool_call = true;
+                continue;
+            }
+
+            let emit_len = safe_tool_prefix_emit_len(&self.buffered);
+            if emit_len > 0 {
+                events.push(OllamaStreamEvent::Text(
+                    self.buffered.drain(..emit_len).collect(),
+                ));
+                continue;
+            }
+            break;
+        }
+        events
+    }
+
+    fn flush(&mut self) -> Vec<OllamaStreamEvent> {
+        if self.buffered.is_empty() {
+            return Vec::new();
+        }
+        let text = if self.in_tool_call {
+            format!("{TOOL_CALL_OPEN}{}", std::mem::take(&mut self.buffered))
+        } else {
+            std::mem::take(&mut self.buffered)
+        };
+        self.in_tool_call = false;
+        vec![OllamaStreamEvent::Text(text)]
+    }
+}
+
+fn safe_tool_prefix_emit_len(text: &str) -> usize {
+    let max_suffix = text.len().min(TOOL_CALL_OPEN.len() - 1);
+    for keep in (1..=max_suffix).rev() {
+        let boundary = text.len() - keep;
+        if text.is_char_boundary(boundary) && TOOL_CALL_OPEN.starts_with(&text[boundary..]) {
+            return boundary;
+        }
+    }
+    text.len()
+}
+
 fn extract_ollama_tool_calls(text: &str) -> (String, Vec<OllamaToolCall>) {
     let mut remaining = text;
     let mut visible = String::new();
     let mut calls = Vec::new();
-    while let Some(start) = remaining.find("<tool_call>") {
+    while let Some(start) = remaining.find(TOOL_CALL_OPEN) {
         visible.push_str(&remaining[..start]);
-        let after_start = &remaining[start + "<tool_call>".len()..];
-        let Some(end) = after_start.find("</tool_call>") else {
+        let after_start = &remaining[start + TOOL_CALL_OPEN.len()..];
+        let Some(end) = after_start.find(TOOL_CALL_CLOSE) else {
             visible.push_str(&remaining[start..]);
             return (visible.trim().to_string(), calls);
         };
@@ -764,12 +952,12 @@ fn extract_ollama_tool_calls(text: &str) -> (String, Vec<OllamaToolCall>) {
         {
             Some(call) => calls.push(call),
             None => {
-                visible.push_str("<tool_call>");
+                visible.push_str(TOOL_CALL_OPEN);
                 visible.push_str(body);
-                visible.push_str("</tool_call>");
+                visible.push_str(TOOL_CALL_CLOSE);
             }
         }
-        remaining = &after_start[end + "</tool_call>".len()..];
+        remaining = &after_start[end + TOOL_CALL_CLOSE.len()..];
     }
     visible.push_str(remaining);
     (visible.trim().to_string(), calls)
@@ -925,5 +1113,49 @@ mod tests {
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].function.name, "read_file");
         assert_eq!(calls[0].function.arguments["path"], "Cargo.toml");
+    }
+
+    #[test]
+    fn bound_ollama_tool_request_caps_tokens_and_adds_stop() {
+        let mut request = crate::inference::InferenceRequest {
+            model: "model".to_string(),
+            prompt: "hi".to_string(),
+            system: None,
+            messages: Vec::new(),
+            stop: Vec::new(),
+            max_tokens: Some(4096),
+            temperature: 0.6,
+            top_p: 0.95,
+            top_k: 20,
+            depth: 2,
+            mtp: true,
+            profile_timings: false,
+        };
+
+        bound_ollama_tool_request(&mut request);
+
+        assert_eq!(request.max_tokens, Some(OLLAMA_TOOL_MAX_TOKENS));
+        assert_eq!(request.stop, vec![TOOL_CALL_CLOSE.to_string()]);
+    }
+
+    #[test]
+    fn tool_stream_filter_extracts_split_tool_call() {
+        let mut filter = OllamaToolStreamFilter::new();
+        let mut events = filter.feed("before <tool");
+        events.extend(
+            filter.feed("_call>\n{\"name\":\"read_file\",\"arguments\":{\"path\":\"Cargo.toml\"}}"),
+        );
+        events.extend(filter.feed("\n</tool_call> after"));
+        events.extend(filter.flush());
+
+        assert_eq!(events.len(), 3);
+        assert!(matches!(&events[0], OllamaStreamEvent::Text(text) if text == "before "));
+        assert!(matches!(
+            &events[1],
+            OllamaStreamEvent::ToolCall(call)
+                if call.function.name == "read_file"
+                    && call.function.arguments["path"] == "Cargo.toml"
+        ));
+        assert!(matches!(&events[2], OllamaStreamEvent::Text(text) if text == " after"));
     }
 }

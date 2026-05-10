@@ -2,3 +2,5 @@ target/
 mtplx
 .DS_Store
 .agent/
+.idea/
+agent

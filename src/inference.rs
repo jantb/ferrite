@@ -7,6 +7,9 @@ use anyhow::Result;
 use mlx_rs::ops::indexing::IndexOp;
 use serde::{Deserialize, Serialize};
 
+#[cfg(feature = "native-mlx")]
+const DEFAULT_MAX_KV_CONTEXT_TOKENS: usize = 65_536;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct InferenceRequest {
     pub model: String,
@@ -131,6 +134,7 @@ struct PromptStateCache {
     logits: mlx_rs::Array,
     hidden: mlx_rs::Array,
     mtp_history_state: crate::qwen36::MtpDecodeState,
+    estimated_bytes: usize,
 }
 
 #[cfg(feature = "native-mlx")]
@@ -995,6 +999,7 @@ fn prepare_prompt_state(
                     )?;
                 }
             }
+            state.clear_transient_block_states();
             let prefill_s = started.elapsed().as_secs_f64();
             maybe_store_prompt_cache(
                 session,
@@ -1034,6 +1039,7 @@ fn prepare_prompt_state(
     } else {
         session.qwen.new_mtp_decode_state().unwrap_or_default()
     };
+    state.clear_transient_block_states();
     let prefill_s = started.elapsed().as_secs_f64();
     maybe_store_prompt_cache(
         session,
@@ -1107,9 +1113,158 @@ fn maybe_store_prompt_cache(
         logits: logits.clone(),
         hidden: hidden.clone(),
         mtp_history_state: mtp_history_state.clone(),
+        estimated_bytes: estimate_prompt_cache_bytes(
+            prompt_ids,
+            state,
+            logits,
+            hidden,
+            mtp_history_state,
+        ),
     });
+    evict_prompt_caches(session, max_entries, prefix_cache_max_bytes());
+}
+
+#[cfg(feature = "native-mlx")]
+fn evict_prompt_caches(session: &mut NativeMlxSession, max_entries: usize, max_bytes: usize) {
     while session.prompt_caches.len() > max_entries {
         session.prompt_caches.remove(0);
+    }
+    if max_bytes == 0 {
+        session.prompt_caches.clear();
+        return;
+    }
+    while prompt_cache_total_bytes(&session.prompt_caches) > max_bytes {
+        let Some((index, _)) = session
+            .prompt_caches
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, cache)| cache.prompt_ids.len())
+        else {
+            break;
+        };
+        session.prompt_caches.remove(index);
+    }
+}
+
+#[cfg(feature = "native-mlx")]
+fn prompt_cache_total_bytes(caches: &[PromptStateCache]) -> usize {
+    caches
+        .iter()
+        .map(|cache| cache.estimated_bytes)
+        .fold(0_usize, usize::saturating_add)
+}
+
+#[cfg(feature = "native-mlx")]
+fn estimate_prompt_cache_bytes(
+    prompt_ids: &[u32],
+    state: &crate::qwen36::DecodeState,
+    logits: &mlx_rs::Array,
+    hidden: &mlx_rs::Array,
+    mtp_history_state: &crate::qwen36::MtpDecodeState,
+) -> usize {
+    prompt_ids
+        .len()
+        .saturating_mul(std::mem::size_of::<u32>())
+        .saturating_add(estimate_decode_state_bytes(state))
+        .saturating_add(estimate_array_bytes(logits))
+        .saturating_add(estimate_array_bytes(hidden))
+        .saturating_add(estimate_full_attention_cache_bytes(
+            &mtp_history_state.cache,
+        ))
+}
+
+#[cfg(feature = "native-mlx")]
+fn estimate_decode_state_bytes(state: &crate::qwen36::DecodeState) -> usize {
+    state
+        .layers
+        .iter()
+        .map(|layer| match layer {
+            crate::qwen36::LayerDecodeState::Full(cache) => {
+                estimate_full_attention_cache_bytes(cache)
+            }
+            crate::qwen36::LayerDecodeState::Linear(cache) => estimate_linear_cache_bytes(cache),
+        })
+        .fold(0_usize, usize::saturating_add)
+}
+
+#[cfg(feature = "native-mlx")]
+fn estimate_full_attention_cache_bytes(cache: &crate::qwen36::FullAttentionCache) -> usize {
+    cache
+        .k
+        .as_ref()
+        .map(estimate_array_bytes)
+        .unwrap_or(0)
+        .saturating_add(cache.v.as_ref().map(estimate_array_bytes).unwrap_or(0))
+}
+
+#[cfg(feature = "native-mlx")]
+fn estimate_linear_cache_bytes(cache: &crate::qwen36::LinearAttentionCache) -> usize {
+    cache
+        .conv_state
+        .len()
+        .saturating_add(cache.recurrent_state.len())
+        .saturating_add(cache.conv_out.len())
+        .saturating_add(cache.recurrent_out.len())
+        .saturating_add(cache.q_normed.len())
+        .saturating_add(cache.k_normed.len())
+        .saturating_mul(std::mem::size_of::<f32>())
+        .saturating_add(
+            cache
+                .metal_conv_state
+                .as_ref()
+                .map(estimate_array_bytes)
+                .unwrap_or(0),
+        )
+        .saturating_add(
+            cache
+                .metal_recurrent_state
+                .as_ref()
+                .map(estimate_array_bytes)
+                .unwrap_or(0),
+        )
+        .saturating_add(
+            cache
+                .metal_conv_block_states
+                .as_ref()
+                .map(estimate_array_bytes)
+                .unwrap_or(0),
+        )
+        .saturating_add(
+            cache
+                .metal_recurrent_block_states
+                .as_ref()
+                .map(estimate_array_bytes)
+                .unwrap_or(0),
+        )
+}
+
+#[cfg(feature = "native-mlx")]
+fn estimate_array_bytes(array: &mlx_rs::Array) -> usize {
+    array
+        .shape()
+        .iter()
+        .try_fold(1_usize, |product, dim| {
+            usize::try_from(*dim)
+                .ok()
+                .and_then(|dim| product.checked_mul(dim))
+        })
+        .unwrap_or(0)
+        .saturating_mul(dtype_bytes(array.dtype()))
+}
+
+#[cfg(feature = "native-mlx")]
+fn dtype_bytes(dtype: mlx_rs::Dtype) -> usize {
+    match dtype {
+        mlx_rs::Dtype::Bool | mlx_rs::Dtype::Uint8 | mlx_rs::Dtype::Int8 => 1,
+        mlx_rs::Dtype::Uint16
+        | mlx_rs::Dtype::Int16
+        | mlx_rs::Dtype::Float16
+        | mlx_rs::Dtype::Bfloat16 => 2,
+        mlx_rs::Dtype::Uint32 | mlx_rs::Dtype::Int32 | mlx_rs::Dtype::Float32 => 4,
+        mlx_rs::Dtype::Uint64
+        | mlx_rs::Dtype::Int64
+        | mlx_rs::Dtype::Float64
+        | mlx_rs::Dtype::Complex64 => 8,
     }
 }
 
@@ -1123,10 +1278,7 @@ fn maybe_store_post_generation_cache(
     start_hidden: mlx_rs::Array,
     mut mtp_history_state: crate::qwen36::MtpDecodeState,
 ) -> Result<()> {
-    if !env_flag("MTPLX_POST_GENERATION_CACHE", true)
-        || !env_flag("MTPLX_PREFIX_CACHE", true)
-        || completion_ids.is_empty()
-    {
+    if !post_generation_cache_enabled() || completion_ids.is_empty() {
         return Ok(());
     }
     let combined_len = prompt_ids.len() + completion_ids.len();
@@ -1137,6 +1289,7 @@ fn maybe_store_post_generation_cache(
         session
             .qwen
             .decode_tokens_logits_with_hidden(completion_ids, &session.plan, &mut state)?;
+    state.clear_transient_block_states();
     let last = completion_ids.len() as i32 - 1;
     let logits = logits.index((.., last..last + 1, ..));
     let last_hidden = hidden.index((.., last..last + 1, ..));
@@ -1169,12 +1322,17 @@ fn maybe_store_post_generation_cache(
 }
 
 #[cfg(feature = "native-mlx")]
+fn post_generation_cache_enabled() -> bool {
+    env_flag("MTPLX_POST_GENERATION_CACHE", false) && env_flag("MTPLX_PREFIX_CACHE", true)
+}
+
+#[cfg(feature = "native-mlx")]
 fn maybe_store_chat_post_generation_cache(
     session: &mut NativeMlxSession,
     request: &InferenceRequest,
     assistant_text: &str,
 ) -> Result<()> {
-    if !env_flag("MTPLX_CHAT_POST_GENERATION_CACHE", true)
+    if !env_flag("MTPLX_CHAT_POST_GENERATION_CACHE", false)
         || !env_flag("MTPLX_PREFIX_CACHE", true)
         || assistant_text.is_empty()
     {
@@ -1218,6 +1376,7 @@ fn maybe_store_chat_post_generation_cache(
         } else {
             session.qwen.new_mtp_decode_state().unwrap_or_default()
         };
+    state.clear_transient_block_states();
     maybe_store_prompt_cache(
         session,
         &prefix_ids,
@@ -1242,7 +1401,42 @@ fn prefix_cache_max_entries() -> usize {
     ferrite_env_var("MTPLX_PREFIX_CACHE_ENTRIES")
         .ok()
         .and_then(|value| value.trim().parse::<usize>().ok())
-        .unwrap_or(4)
+        .unwrap_or(2)
+}
+
+#[cfg(feature = "native-mlx")]
+fn prefix_cache_max_bytes() -> usize {
+    ferrite_env_var("MTPLX_PREFIX_CACHE_MAX_BYTES")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .unwrap_or(4 * 1024 * 1024 * 1024)
+}
+
+#[cfg(feature = "native-mlx")]
+fn max_kv_context_tokens() -> usize {
+    ferrite_env_var("MTPLX_MAX_KV_CONTEXT_TOKENS")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_MAX_KV_CONTEXT_TOKENS)
+}
+
+#[cfg(feature = "native-mlx")]
+fn bounded_max_tokens(
+    prompt_tokens: usize,
+    requested_max_tokens: u32,
+    max_context_tokens: usize,
+) -> Result<u32> {
+    if requested_max_tokens == 0 {
+        return Ok(0);
+    }
+    if prompt_tokens >= max_context_tokens {
+        anyhow::bail!(
+            "request context too large: prompt has {prompt_tokens} tokens, max KV context is {max_context_tokens}; reduce input or set FERRITE_MAX_KV_CONTEXT_TOKENS"
+        );
+    }
+    let remaining = max_context_tokens - prompt_tokens;
+    Ok(requested_max_tokens.min(remaining.min(u32::MAX as usize) as u32))
 }
 
 impl NativeMlxBackend {
@@ -1292,6 +1486,11 @@ impl NativeMlxBackend {
                 .ok_or_else(|| anyhow::anyhow!("native MLX model cache was not initialized"))?;
             let load_s = load_started.elapsed().as_secs_f64();
             let prompt_ids = session.model.encode_prompt(request)?;
+            let max_tokens = bounded_max_tokens(
+                prompt_ids.len(),
+                request.max_tokens.unwrap_or(1),
+                max_kv_context_tokens(),
+            )?;
             let eos_token_ids = session.model.eos_token_ids();
             let sampling = crate::sampling::SamplingConfig {
                 temperature: request.temperature,
@@ -1300,7 +1499,6 @@ impl NativeMlxBackend {
             };
             let mut completion_ids = Vec::new();
             let mut finish_reason = FinishReason::Length;
-            let max_tokens = request.max_tokens.unwrap_or(1);
             let mut prefill_s = 0.0;
             let mut prefix_cache_hit = false;
             let mut prefix_cache_tokens = 0_usize;
@@ -1316,9 +1514,8 @@ impl NativeMlxBackend {
                 prefix_cache_hit = prepared.prefix_cache_hit;
                 prefix_cache_tokens = prepared.prefix_cache_tokens;
                 if request.mtp && request.depth > 0 && session.qwen.mtp.is_some() {
-                    let cache_base_state = state.clone();
-                    let cache_base_hidden = hidden.clone();
-                    let cache_base_mtp_history_state = mtp_history_state.clone();
+                    let post_generation_cache_base = post_generation_cache_enabled()
+                        .then(|| (state.clone(), hidden.clone(), mtp_history_state.clone()));
                     let persistent_mtp = env_flag("MTPLX_PERSISTENT_MTP", true);
                     let generated = generate_mtp(
                         session,
@@ -1343,7 +1540,13 @@ impl NativeMlxBackend {
                             .decode(&generated.completion_ids, true)
                             .map_err(|err| anyhow::anyhow!("decode completion: {err}"))?,
                     };
-                    if !stopped_on_text {
+                    if !stopped_on_text
+                        && let Some((
+                            cache_base_state,
+                            cache_base_hidden,
+                            cache_base_mtp_history_state,
+                        )) = post_generation_cache_base
+                    {
                         maybe_store_post_generation_cache(
                             session,
                             request,
@@ -1379,14 +1582,8 @@ impl NativeMlxBackend {
                         mtp: generated.mtp,
                     });
                 }
-                let cache_base_state = state.clone();
-                let cache_base_hidden = hidden.clone();
-                let cache_base_mtp_history_state = mtp_history_state.clone();
-                post_generation_cache_base = Some((
-                    cache_base_state,
-                    cache_base_hidden,
-                    cache_base_mtp_history_state,
-                ));
+                post_generation_cache_base = post_generation_cache_enabled()
+                    .then(|| (state.clone(), hidden.clone(), mtp_history_state.clone()));
                 let mut next = crate::sampling::next_from_logits(&logits, sampling)?;
                 if eos_token_ids.contains(&next) {
                     let total_s = total_started.elapsed().as_secs_f64();
@@ -1581,5 +1778,13 @@ mod tests {
     #[test]
     fn trim_at_stop_ignores_empty_stops() {
         assert_eq!(trim_at_stop("alpha".to_string(), &["".to_string()]), None);
+    }
+
+    #[cfg(feature = "native-mlx")]
+    #[test]
+    fn bounded_max_tokens_respects_context_limit() {
+        assert_eq!(bounded_max_tokens(60, 16, 64).unwrap(), 4);
+        assert_eq!(bounded_max_tokens(64, 0, 64).unwrap(), 0);
+        assert!(bounded_max_tokens(64, 1, 64).is_err());
     }
 }
