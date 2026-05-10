@@ -28,6 +28,8 @@ const DEFAULT_MLX_CACHE_LIMIT_BYTES: usize = 512 * 1024 * 1024;
 const DEFAULT_MLX_MEMORY_LIMIT_BYTES: usize = 8 * 1024 * 1024 * 1024;
 #[cfg(feature = "native-mlx")]
 const DEFAULT_RSS_KILL_PERCENT: u64 = 50;
+#[cfg(feature = "native-mlx")]
+const DEFAULT_MLX_ACTIVE_KILL_PERCENT: u64 = 80;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct InferenceRequest {
@@ -497,6 +499,22 @@ fn check_kill_switch(phase: &str) -> Result<()> {
         clear_mlx_cache();
         anyhow::bail!("Ferrite RSS kill switch tripped: rss={rss} limit={limit}");
     }
+    if let Some(limit) = mlx_active_kill_limit_bytes() {
+        let active = mlx_memory_value(mlx_sys::mlx_get_active_memory);
+        if let Some(active) = active
+            && active > limit
+        {
+            log_memory_sample(
+                "kill_switch",
+                phase,
+                &format!("reason=mlx_active mlx_active_bytes={active} limit_bytes={limit}"),
+            );
+            clear_mlx_cache();
+            anyhow::bail!(
+                "Ferrite MLX active-memory kill switch tripped: active={active} limit={limit}"
+            );
+        }
+    }
     Ok(())
 }
 
@@ -504,13 +522,26 @@ fn check_kill_switch(phase: &str) -> Result<()> {
 fn memory_watchdog_loop(request_label: &'static str, alive: Arc<AtomicBool>, interval: Duration) {
     while alive.load(Ordering::Relaxed) {
         if kill_switch_path().exists() {
-            hard_exit_from_watchdog(request_label, "file", None, None);
+            hard_exit_from_watchdog(request_label, "file", None, None, None, None);
         }
         if let Some(limit) = rss_kill_limit_bytes()
             && let Some(rss) = process_rss_bytes()
             && rss > limit
         {
-            hard_exit_from_watchdog(request_label, "rss", Some(rss), Some(limit));
+            hard_exit_from_watchdog(request_label, "rss", Some(rss), Some(limit), None, None);
+        }
+        if let Some(limit) = mlx_active_kill_limit_bytes()
+            && let Some(active) = mlx_memory_value(mlx_sys::mlx_get_active_memory)
+            && active > limit
+        {
+            hard_exit_from_watchdog(
+                request_label,
+                "mlx_active",
+                None,
+                None,
+                Some(active),
+                Some(limit),
+            );
         }
         thread::sleep(interval);
     }
@@ -521,19 +552,27 @@ fn hard_exit_from_watchdog(
     request_label: &'static str,
     reason: &str,
     rss_bytes: Option<u64>,
-    limit_bytes: Option<u64>,
+    rss_limit_bytes: Option<u64>,
+    mlx_active_bytes: Option<usize>,
+    mlx_active_limit_bytes: Option<usize>,
 ) -> ! {
     let snapshot = memory_snapshot();
     let line = format!(
-        "ferrite_memory request={request_label} phase=watchdog_hard_exit reason={reason} rss_bytes={} limit_bytes={} mlx_active_bytes={} mlx_cache_bytes={} mlx_peak_bytes={}",
+        "ferrite_memory request={request_label} phase=watchdog_hard_exit reason={reason} rss_bytes={} rss_limit_bytes={} mlx_active_bytes={} mlx_active_limit_bytes={} mlx_cache_bytes={} mlx_peak_bytes={}",
         rss_bytes
             .or(snapshot.rss_bytes)
             .map(|value| value.to_string())
             .unwrap_or_else(|| "unknown".to_string()),
-        limit_bytes
+        rss_limit_bytes
             .map(|value| value.to_string())
             .unwrap_or_else(|| "unknown".to_string()),
-        optional_usize(snapshot.mlx_active_bytes),
+        mlx_active_bytes
+            .or(snapshot.mlx_active_bytes)
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "unknown".to_string()),
+        mlx_active_limit_bytes
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "unknown".to_string()),
         optional_usize(snapshot.mlx_cache_bytes),
         optional_usize(snapshot.mlx_peak_bytes),
     );
@@ -566,6 +605,20 @@ fn rss_kill_limit_bytes() -> Option<u64> {
         Ok(value) => value.trim().parse::<u64>().ok().filter(|value| *value > 0),
         Err(_) => physical_memory_bytes()
             .map(|bytes| bytes.saturating_mul(DEFAULT_RSS_KILL_PERCENT) / 100),
+    }
+}
+
+#[cfg(feature = "native-mlx")]
+fn mlx_active_kill_limit_bytes() -> Option<usize> {
+    match ferrite_env_var("MTPLX_MLX_ACTIVE_KILL_BYTES") {
+        Ok(value) => value
+            .trim()
+            .parse::<usize>()
+            .ok()
+            .filter(|value| *value > 0),
+        Err(_) => physical_memory_bytes()
+            .and_then(|bytes| bytes.checked_mul(DEFAULT_MLX_ACTIVE_KILL_PERCENT))
+            .and_then(|bytes| usize::try_from(bytes / 100).ok()),
     }
 }
 
@@ -1500,10 +1553,24 @@ fn prepare_prompt_state_chunked(
     for (chunk_index, chunk) in prompt_ids.chunks(chunk_tokens).enumerate() {
         check_kill_switch("prefill_chunk_before")?;
         let previous_hidden = hidden.clone();
-        let chunk_hidden = session
-            .qwen
-            .decode_tokens_hidden(chunk, &session.plan, &mut state)?;
-        chunk_hidden.eval()?;
+        let chunk_hidden = if needs_mtp_history {
+            let chunk_hidden =
+                session
+                    .qwen
+                    .decode_tokens_hidden(chunk, &session.plan, &mut state)?;
+            chunk_hidden.eval()?;
+            Some(chunk_hidden)
+        } else {
+            None
+        };
+        let last_hidden = if let Some(chunk_hidden) = &chunk_hidden {
+            let last = chunk.len() as i32 - 1;
+            chunk_hidden.index((.., last..last + 1, ..))
+        } else {
+            session
+                .qwen
+                .decode_tokens_last_hidden(chunk, &session.plan, &mut state)?
+        };
         state.clear_transient_block_states();
 
         if needs_mtp_history {
@@ -1513,16 +1580,18 @@ fn prepare_prompt_state_chunked(
                     &mut mtp_history_state,
                     &previous_hidden,
                     chunk,
-                    &chunk_hidden,
+                    chunk_hidden.as_ref().expect("MTP chunk hidden exists"),
                 )?;
             } else {
-                mtp_history_state = seed_mtp_history_from_prompt(session, chunk, &chunk_hidden)?;
+                mtp_history_state = seed_mtp_history_from_prompt(
+                    session,
+                    chunk,
+                    chunk_hidden.as_ref().expect("MTP chunk hidden exists"),
+                )?;
             }
             eval_mtp_decode_state(&mtp_history_state)?;
         }
 
-        let last = chunk.len() as i32 - 1;
-        let last_hidden = chunk_hidden.index((.., last..last + 1, ..));
         let last_logits = session.qwen.logits_from_hidden(&last_hidden)?;
         last_hidden.eval()?;
         last_logits.eval()?;
@@ -1568,10 +1637,23 @@ fn extend_prompt_state_chunked(
     for (chunk_index, chunk) in suffix.chunks(prefill_chunk_tokens()).enumerate() {
         check_kill_switch("prefill_suffix_chunk_before")?;
         let previous_hidden = hidden.clone();
-        let chunk_hidden = session
-            .qwen
-            .decode_tokens_hidden(chunk, &session.plan, state)?;
-        chunk_hidden.eval()?;
+        let chunk_hidden = if needs_mtp_history {
+            let chunk_hidden = session
+                .qwen
+                .decode_tokens_hidden(chunk, &session.plan, state)?;
+            chunk_hidden.eval()?;
+            Some(chunk_hidden)
+        } else {
+            None
+        };
+        let last_hidden = if let Some(chunk_hidden) = &chunk_hidden {
+            let last = chunk.len() as i32 - 1;
+            chunk_hidden.index((.., last..last + 1, ..))
+        } else {
+            session
+                .qwen
+                .decode_tokens_last_hidden(chunk, &session.plan, state)?
+        };
         state.clear_transient_block_states();
 
         if needs_mtp_history {
@@ -1580,13 +1662,11 @@ fn extend_prompt_state_chunked(
                 mtp_history_state,
                 &previous_hidden,
                 chunk,
-                &chunk_hidden,
+                chunk_hidden.as_ref().expect("MTP chunk hidden exists"),
             )?;
             eval_mtp_decode_state(mtp_history_state)?;
         }
 
-        let last = chunk.len() as i32 - 1;
-        let last_hidden = chunk_hidden.index((.., last..last + 1, ..));
         let last_logits = session.qwen.logits_from_hidden(&last_hidden)?;
         last_hidden.eval()?;
         last_logits.eval()?;
@@ -1987,7 +2067,7 @@ fn prefill_chunk_tokens() -> usize {
         .ok()
         .and_then(|value| value.trim().parse::<usize>().ok())
         .filter(|value| *value > 0)
-        .unwrap_or(128)
+        .unwrap_or(256)
 }
 
 #[cfg(feature = "native-mlx")]

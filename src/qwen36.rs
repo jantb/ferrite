@@ -1899,6 +1899,30 @@ impl Qwen36Weights {
         self.final_norm.forward(&hidden)
     }
 
+    pub fn decode_tokens_last_hidden(
+        &self,
+        input_ids: &[u32],
+        plan: &Qwen36Plan,
+        state: &mut DecodeState,
+    ) -> Result<mlx_rs::Array> {
+        if input_ids.is_empty() {
+            bail!("decode token block cannot be empty");
+        }
+        if state.layers.len() != self.layers.len() {
+            bail!("decode state layer count mismatch");
+        }
+        let input = input_ids.iter().map(|id| *id as i32).collect::<Vec<_>>();
+        let input_ids = mlx_rs::Array::from_slice(&input, &[1, input.len() as i32]);
+        let mut hidden = self.embeddings.forward(&input_ids)?;
+        for (layer, cache) in self.layers.iter().zip(state.layers.iter_mut()) {
+            hidden = layer.forward_decode_tokens(&hidden, plan, state.position, cache)?;
+        }
+        state.position += input.len() as i32;
+        let last = input.len() as i32 - 1;
+        self.final_norm
+            .forward(&hidden.index((.., last..last + 1, ..)))
+    }
+
     pub fn logits_from_hidden(&self, hidden: &mlx_rs::Array) -> Result<mlx_rs::Array> {
         self.lm_head.forward(hidden)
     }
