@@ -258,6 +258,34 @@ impl FullAttentionCache {
         let prev = self.current_len();
         let steps = k_shape[2];
         let end = prev + steps;
+        if full_kv_cache_append_mode() == FullKvCacheAppendMode::Concat {
+            let next_k = match self.k.take() {
+                Some(prev_k) if prev > 0 => {
+                    let active = if prev >= prev_k.shape()[2] {
+                        prev_k
+                    } else {
+                        prev_k.index((.., .., 0..prev, ..))
+                    };
+                    concatenate_axis(&[active, k], 2)?
+                }
+                _ => k,
+            };
+            let next_v = match self.v.take() {
+                Some(prev_v) if prev > 0 => {
+                    let active = if prev >= prev_v.shape()[2] {
+                        prev_v
+                    } else {
+                        prev_v.index((.., .., 0..prev, ..))
+                    };
+                    concatenate_axis(&[active, v], 2)?
+                }
+                _ => v,
+            };
+            self.offset = end;
+            self.k = Some(next_k.clone());
+            self.v = Some(next_v.clone());
+            return Ok((next_k, next_v, prev));
+        }
         self.ensure_capacity(end, &k, &v)?;
         self.k
             .as_mut()
@@ -314,6 +342,26 @@ impl FullAttentionCache {
         self.v = Some(next_v);
         self.offset = prev;
         Ok(())
+    }
+}
+
+#[cfg(feature = "native-mlx")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FullKvCacheAppendMode {
+    TailOwned,
+    Concat,
+}
+
+#[cfg(feature = "native-mlx")]
+fn full_kv_cache_append_mode() -> FullKvCacheAppendMode {
+    match std::env::var("FERRITE_FULL_KV_CACHE_APPEND")
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "concat" => FullKvCacheAppendMode::Concat,
+        _ => FullKvCacheAppendMode::TailOwned,
     }
 }
 
@@ -1035,14 +1083,15 @@ impl FullAttentionWeights {
         )?;
         let (active_k, active_v, prev_len) = cache.append_and_fetch(k, projected.v)?;
         let total_keys = active_k.shape()[2];
-        let mask = decode_block_causal_mask(tokens, total_keys, prev_len, q.dtype())?;
-        let attended = mlx_rs::fast::scaled_dot_product_attention(
-            &q,
-            &active_k,
-            &active_v,
-            1.0 / (head_dim as f32).sqrt(),
-            &mask,
-        )?;
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        let attended = if let Some(chunk) = split_full_attention_chunk_tokens(tokens, prev_len) {
+            split_decode_scaled_dot_product_attention(
+                &q, &active_k, &active_v, tokens, prev_len, chunk, scale,
+            )?
+        } else {
+            let mask = decode_block_causal_mask(tokens, total_keys, prev_len, q.dtype())?;
+            mlx_rs::fast::scaled_dot_product_attention(&q, &active_k, &active_v, scale, &mask)?
+        };
         let merged = attended.transpose_axes(&[0, 2, 1, 3])?.reshape(&[
             batch,
             tokens,
@@ -1051,6 +1100,60 @@ impl FullAttentionWeights {
         let merged = apply_attention_gate(merged, projected.gate.as_ref())?;
         self.o_proj.forward(&merged)
     }
+}
+
+#[cfg(feature = "native-mlx")]
+fn split_full_attention_chunk_tokens(tokens: i32, prev_len: i32) -> Option<i32> {
+    let enabled = std::env::var("FERRITE_SPLIT_FULL_ATTN")
+        .ok()
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(true);
+    if !enabled {
+        return None;
+    }
+    let threshold = std::env::var("FERRITE_SPLIT_FULL_ATTN_THRESHOLD")
+        .ok()
+        .and_then(|value| value.trim().parse::<i32>().ok())
+        .filter(|value| *value >= 0)
+        .unwrap_or(1024);
+    let chunk = std::env::var("FERRITE_SPLIT_FULL_ATTN_CHUNK_TOKENS")
+        .ok()
+        .and_then(|value| value.trim().parse::<i32>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(128);
+    (prev_len >= threshold && tokens > chunk).then_some(chunk)
+}
+
+#[cfg(feature = "native-mlx")]
+fn split_decode_scaled_dot_product_attention(
+    q: &mlx_rs::Array,
+    k: &mlx_rs::Array,
+    v: &mlx_rs::Array,
+    tokens: i32,
+    prev_len: i32,
+    chunk: i32,
+    scale: f32,
+) -> Result<mlx_rs::Array> {
+    let mut outputs = Vec::new();
+    let mut start = 0;
+    while start < tokens {
+        let end = (start + chunk).min(tokens);
+        let key_end = (prev_len + end).min(k.shape()[2]);
+        let q_chunk = q.index((.., .., start..end, ..));
+        let k_chunk = k.index((.., .., 0..key_end, ..));
+        let v_chunk = v.index((.., .., 0..key_end, ..));
+        let mask = decode_block_causal_mask(end - start, key_end, prev_len + start, q.dtype())?;
+        outputs.push(mlx_rs::fast::scaled_dot_product_attention(
+            &q_chunk, &k_chunk, &v_chunk, scale, &mask,
+        )?);
+        start = end;
+    }
+    Ok(concatenate_axis(&outputs, 2)?)
 }
 
 #[cfg(feature = "native-mlx")]

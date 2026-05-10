@@ -1550,6 +1550,7 @@ fn prepare_prompt_state_chunked(
     };
 
     let chunk_tokens = prefill_chunk_tokens();
+    let eval_interval = prefill_eval_interval_chunks();
     let mut consumed_tokens = 0_usize;
     for (chunk_index, chunk) in prompt_ids.chunks(chunk_tokens).enumerate() {
         check_kill_switch("prefill_chunk_before")?;
@@ -1561,8 +1562,10 @@ fn prepare_prompt_state_chunked(
                 .qwen
                 .decode_tokens_cache_only(chunk, &session.plan, &mut state)?;
             state.clear_transient_block_states();
-            eval_decode_state(&state)?;
-            clear_mlx_cache();
+            if should_eval_prefill_chunk(chunk_index, eval_interval) {
+                eval_decode_state(&state)?;
+                clear_mlx_cache();
+            }
 
             if memory_trace_enabled() {
                 log_memory_sample(
@@ -1661,6 +1664,7 @@ fn extend_prompt_state_chunked(
     needs_mtp_history: bool,
 ) -> Result<()> {
     let _ = request;
+    let eval_interval = prefill_eval_interval_chunks();
     let mut consumed_tokens = 0_usize;
     for (chunk_index, chunk) in suffix.chunks(prefill_chunk_tokens()).enumerate() {
         check_kill_switch("prefill_suffix_chunk_before")?;
@@ -1672,8 +1676,10 @@ fn extend_prompt_state_chunked(
                 .qwen
                 .decode_tokens_cache_only(chunk, &session.plan, state)?;
             state.clear_transient_block_states();
-            eval_decode_state(state)?;
-            clear_mlx_cache();
+            if should_eval_prefill_chunk(chunk_index, eval_interval) {
+                eval_decode_state(state)?;
+                clear_mlx_cache();
+            }
 
             if memory_trace_enabled() {
                 log_memory_sample(
@@ -2122,6 +2128,20 @@ fn prefill_chunk_tokens() -> usize {
         .and_then(|value| value.trim().parse::<usize>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(128)
+}
+
+#[cfg(feature = "native-mlx")]
+fn prefill_eval_interval_chunks() -> usize {
+    ferrite_env_var("MTPLX_PREFILL_EVAL_INTERVAL_CHUNKS")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(1)
+}
+
+#[cfg(feature = "native-mlx")]
+fn should_eval_prefill_chunk(chunk_index: usize, interval: usize) -> bool {
+    (chunk_index + 1).is_multiple_of(interval)
 }
 
 #[cfg(feature = "native-mlx")]
