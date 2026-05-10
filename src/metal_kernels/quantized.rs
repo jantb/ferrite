@@ -40,7 +40,7 @@ fn small_m_qmv4_m_enabled(m: i32) -> bool {
         .unwrap_or(false)
 }
 
-const DEFAULT_SMALL_M_QMV4_M_VALUES: [bool; 7] = [false, true, false, false, true, true, true];
+const DEFAULT_SMALL_M_QMV4_M_VALUES: [bool; 7] = [false, true, false, false, false, true, true];
 
 fn small_m_qmv4_m_values_to_max(max_m: i32) -> [bool; 7] {
     let mut values = [false; 7];
@@ -79,7 +79,7 @@ pub(super) fn small_m_qmv4_m_values_from_str(value: &str) -> Option<[bool; 7]> {
 fn small_m_qmv4_simdgroups() -> i32 {
     static SIMDGROUPS: OnceLock<i32> = OnceLock::new();
     *SIMDGROUPS
-        .get_or_init(|| qmv4_simdgroups_or_default(env_i32("FERRITE_SMALL_M_QMV4_SIMDGROUPS", 4)))
+        .get_or_init(|| qmv4_simdgroups_or_default(env_i32("FERRITE_SMALL_M_QMV4_SIMDGROUPS", 8)))
 }
 
 fn small_m_qmv4_packs_per_thread() -> i32 {
