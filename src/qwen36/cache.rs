@@ -1,3 +1,5 @@
+use std::sync::OnceLock;
+
 use anyhow::{Result, bail};
 use mlx_rs::ops::concatenate_axis;
 use mlx_rs::ops::indexing::IndexOp;
@@ -24,11 +26,14 @@ pub struct FullAttentionCache {
 
 impl FullAttentionCache {
     fn capacity_step() -> i32 {
-        std::env::var("FERRITE_FULL_KV_CACHE_STEP")
-            .ok()
-            .and_then(|value| value.trim().parse::<i32>().ok())
-            .filter(|value| *value > 0)
-            .unwrap_or(256)
+        static VALUE: OnceLock<i32> = OnceLock::new();
+        *VALUE.get_or_init(|| {
+            std::env::var("FERRITE_FULL_KV_CACHE_STEP")
+                .ok()
+                .and_then(|value| value.trim().parse::<i32>().ok())
+                .filter(|value| *value > 0)
+                .unwrap_or(256)
+        })
     }
 
     pub(super) fn current_len(&self) -> i32 {
@@ -254,25 +259,31 @@ enum FullKvCacheAppendMode {
 }
 
 fn full_kv_cache_append_mode() -> FullKvCacheAppendMode {
-    match std::env::var("FERRITE_FULL_KV_CACHE_APPEND")
-        .unwrap_or_default()
-        .trim()
-        .to_ascii_lowercase()
-        .as_str()
-    {
-        "concat" => FullKvCacheAppendMode::Concat,
-        _ => FullKvCacheAppendMode::TailOwned,
-    }
+    static VALUE: OnceLock<FullKvCacheAppendMode> = OnceLock::new();
+    *VALUE.get_or_init(|| {
+        match std::env::var("FERRITE_FULL_KV_CACHE_APPEND")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "concat" => FullKvCacheAppendMode::Concat,
+            _ => FullKvCacheAppendMode::TailOwned,
+        }
+    })
 }
 
 #[cfg(feature = "native-mlx")]
 fn prefill_reserve_enabled() -> bool {
-    std::env::var("FERRITE_FULL_KV_CACHE_PREFILL_RESERVE")
-        .map(|value| {
-            let value = value.trim().to_ascii_lowercase();
-            !matches!(value.as_str(), "0" | "false" | "no" | "off")
-        })
-        .unwrap_or(true)
+    static VALUE: OnceLock<bool> = OnceLock::new();
+    *VALUE.get_or_init(|| {
+        std::env::var("FERRITE_FULL_KV_CACHE_PREFILL_RESERVE")
+            .map(|value| {
+                let value = value.trim().to_ascii_lowercase();
+                !matches!(value.as_str(), "0" | "false" | "no" | "off")
+            })
+            .unwrap_or(true)
+    })
 }
 
 #[derive(Clone, Debug)]

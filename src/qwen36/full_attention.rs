@@ -1,3 +1,5 @@
+use std::sync::OnceLock;
+
 use anyhow::{Result, bail};
 use mlx_rs::ops::concatenate_axis;
 use mlx_rs::ops::indexing::IndexOp;
@@ -333,7 +335,73 @@ impl FullAttentionWeights {
 }
 
 fn blockwise_full_attention_enabled(tokens: i32, prev_len: i32) -> bool {
-    let enabled = std::env::var("FERRITE_BLOCKWISE_FULL_ATTN")
+    let config = blockwise_full_attention_config();
+    if !config.enabled {
+        return false;
+    }
+    tokens > 1 && prev_len >= config.threshold
+}
+
+fn blockwise_full_attention_block_tokens() -> i32 {
+    blockwise_full_attention_config().block_tokens
+}
+
+#[derive(Clone, Copy)]
+struct BlockwiseFullAttentionConfig {
+    enabled: bool,
+    threshold: i32,
+    block_tokens: i32,
+}
+
+fn blockwise_full_attention_config() -> BlockwiseFullAttentionConfig {
+    static VALUE: OnceLock<BlockwiseFullAttentionConfig> = OnceLock::new();
+    *VALUE.get_or_init(|| BlockwiseFullAttentionConfig {
+        enabled: env_flag("FERRITE_BLOCKWISE_FULL_ATTN", false),
+        threshold: std::env::var("FERRITE_BLOCKWISE_FULL_ATTN_THRESHOLD")
+            .ok()
+            .and_then(|value| value.trim().parse::<i32>().ok())
+            .filter(|value| *value >= 0)
+            .unwrap_or(1024),
+        block_tokens: std::env::var("FERRITE_BLOCKWISE_FULL_ATTN_BLOCK_TOKENS")
+            .ok()
+            .and_then(|value| value.trim().parse::<i32>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(512),
+    })
+}
+
+fn split_full_attention_chunk_tokens(tokens: i32, prev_len: i32) -> Option<i32> {
+    let config = split_full_attention_config();
+    (config.enabled && prev_len >= config.threshold && tokens > config.chunk)
+        .then_some(config.chunk)
+}
+
+#[derive(Clone, Copy)]
+struct SplitFullAttentionConfig {
+    enabled: bool,
+    threshold: i32,
+    chunk: i32,
+}
+
+fn split_full_attention_config() -> SplitFullAttentionConfig {
+    static VALUE: OnceLock<SplitFullAttentionConfig> = OnceLock::new();
+    *VALUE.get_or_init(|| SplitFullAttentionConfig {
+        enabled: env_flag("FERRITE_SPLIT_FULL_ATTN", true),
+        threshold: std::env::var("FERRITE_SPLIT_FULL_ATTN_THRESHOLD")
+            .ok()
+            .and_then(|value| value.trim().parse::<i32>().ok())
+            .filter(|value| *value >= 0)
+            .unwrap_or(1024),
+        chunk: std::env::var("FERRITE_SPLIT_FULL_ATTN_CHUNK_TOKENS")
+            .ok()
+            .and_then(|value| value.trim().parse::<i32>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(128),
+    })
+}
+
+fn env_flag(name: &str, default: bool) -> bool {
+    std::env::var(name)
         .ok()
         .map(|value| {
             matches!(
@@ -341,24 +409,7 @@ fn blockwise_full_attention_enabled(tokens: i32, prev_len: i32) -> bool {
                 "1" | "true" | "yes" | "on"
             )
         })
-        .unwrap_or(false);
-    if !enabled {
-        return false;
-    }
-    let threshold = std::env::var("FERRITE_BLOCKWISE_FULL_ATTN_THRESHOLD")
-        .ok()
-        .and_then(|value| value.trim().parse::<i32>().ok())
-        .filter(|value| *value >= 0)
-        .unwrap_or(1024);
-    tokens > 1 && prev_len >= threshold
-}
-
-fn blockwise_full_attention_block_tokens() -> i32 {
-    std::env::var("FERRITE_BLOCKWISE_FULL_ATTN_BLOCK_TOKENS")
-        .ok()
-        .and_then(|value| value.trim().parse::<i32>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(512)
+        .unwrap_or(default)
 }
 
 fn blockwise_decode_scaled_dot_product_attention(
@@ -480,32 +531,6 @@ fn causal_position_mask(
         }
     }
     Ok(mlx_rs::Array::from_slice(&values, &[1, 1, tokens, block_len]).as_dtype(dtype)?)
-}
-
-fn split_full_attention_chunk_tokens(tokens: i32, prev_len: i32) -> Option<i32> {
-    let enabled = std::env::var("FERRITE_SPLIT_FULL_ATTN")
-        .ok()
-        .map(|value| {
-            matches!(
-                value.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
-        .unwrap_or(true);
-    if !enabled {
-        return None;
-    }
-    let threshold = std::env::var("FERRITE_SPLIT_FULL_ATTN_THRESHOLD")
-        .ok()
-        .and_then(|value| value.trim().parse::<i32>().ok())
-        .filter(|value| *value >= 0)
-        .unwrap_or(1024);
-    let chunk = std::env::var("FERRITE_SPLIT_FULL_ATTN_CHUNK_TOKENS")
-        .ok()
-        .and_then(|value| value.trim().parse::<i32>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(128);
-    (prev_len >= threshold && tokens > chunk).then_some(chunk)
 }
 
 fn split_decode_scaled_dot_product_attention(
