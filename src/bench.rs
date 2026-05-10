@@ -84,6 +84,25 @@ pub struct MtpBenchResult {
 }
 
 #[derive(Clone, Debug, Serialize)]
+pub struct Qmv4BenchResult {
+    pub k: i32,
+    pub n: i32,
+    pub group_size: i32,
+    pub iterations: u32,
+    pub warmup: u32,
+    pub cases: Vec<Qmv4BenchCase>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct Qmv4BenchCase {
+    pub m: i32,
+    pub stock_ms_per_iter: f64,
+    pub ferrite_ms_per_iter: f64,
+    pub speedup: f64,
+    pub max_abs_diff: f32,
+}
+
+#[derive(Clone, Debug, Serialize)]
 pub struct ContextProbeResult {
     pub model: String,
     pub source_prompt_tokens: usize,
@@ -104,6 +123,139 @@ pub struct ContextProbeCase {
     pub output_tokens_per_s: f64,
     pub estimated_full_attention_kv_gib: f64,
     pub estimated_prompt_hidden_gib: f64,
+}
+
+#[cfg(feature = "native-mlx")]
+pub fn run_qmv4_bench(
+    m_values: &[i32],
+    k: i32,
+    n: i32,
+    group_size: i32,
+    iterations: u32,
+    warmup: u32,
+) -> Result<Qmv4BenchResult> {
+    anyhow::ensure!(k > 0 && n > 0, "K and N must be positive");
+    anyhow::ensure!(
+        k % 512 == 0,
+        "K must be divisible by 512 for qmv4 fast path"
+    );
+    anyhow::ensure!(
+        matches!(group_size, 32 | 64 | 128),
+        "group size must be 32, 64, or 128"
+    );
+    anyhow::ensure!(
+        k % group_size == 0,
+        "K must be divisible by the quantization group size"
+    );
+    anyhow::ensure!(iterations > 0, "iterations must be positive");
+    anyhow::ensure!(
+        crate::metal_kernels::metal_is_available(),
+        "Metal is not available"
+    );
+
+    let dense_w_values = (0..(n * k))
+        .map(|idx| (((idx * 17 + 11) % 41) as f32 - 20.0) / 17.0)
+        .collect::<Vec<_>>();
+    let dense_w =
+        mlx_rs::Array::from_slice(&dense_w_values, &[n, k]).as_dtype(mlx_rs::Dtype::Bfloat16)?;
+    let (weight, scales, biases) = mlx_rs::ops::quantize(&dense_w, group_size, 4)?;
+    weight.eval()?;
+    scales.eval()?;
+    biases.eval()?;
+    let linear = crate::mlx_backend::QuantizedLinear {
+        weight,
+        scales,
+        biases,
+        bias: None,
+        group_size,
+        bits: 4,
+    };
+
+    let mut cases = Vec::with_capacity(m_values.len());
+    for &m in m_values {
+        anyhow::ensure!((1..=6).contains(&m), "M must be in 1..=6 for qmv4");
+        let x_values = (0..(m * k))
+            .map(|idx| (((idx * 13 + 7) % 37) as f32 - 18.0) / 19.0)
+            .collect::<Vec<_>>();
+        let x = mlx_rs::Array::from_slice(&x_values, &[m, k]).as_dtype(mlx_rs::Dtype::Bfloat16)?;
+
+        for _ in 0..warmup {
+            let stock = mlx_rs::ops::quantized_matmul(
+                &x,
+                &linear.weight,
+                &linear.scales,
+                &linear.biases,
+                true,
+                group_size,
+                4,
+            )?;
+            stock.eval()?;
+            let ferrite = crate::metal_kernels::small_m_qmv4_matmul_for_bench(&x, &linear)?
+                .ok_or_else(|| anyhow::anyhow!("qmv4 fast path was not eligible"))?;
+            ferrite.eval()?;
+        }
+
+        let stock_started = Instant::now();
+        let mut stock_last = None;
+        for _ in 0..iterations {
+            let y = mlx_rs::ops::quantized_matmul(
+                &x,
+                &linear.weight,
+                &linear.scales,
+                &linear.biases,
+                true,
+                group_size,
+                4,
+            )?;
+            y.eval()?;
+            stock_last = Some(y);
+        }
+        let stock_elapsed_s = stock_started.elapsed().as_secs_f64();
+
+        let ferrite_started = Instant::now();
+        let mut ferrite_last = None;
+        for _ in 0..iterations {
+            let y = crate::metal_kernels::small_m_qmv4_matmul_for_bench(&x, &linear)?
+                .ok_or_else(|| anyhow::anyhow!("qmv4 fast path was not eligible"))?;
+            y.eval()?;
+            ferrite_last = Some(y);
+        }
+        let ferrite_elapsed_s = ferrite_started.elapsed().as_secs_f64();
+
+        let stock = stock_last
+            .expect("stock qmv bench ran at least one iteration")
+            .as_dtype(mlx_rs::Dtype::Float32)?;
+        let ferrite = ferrite_last
+            .expect("ferrite qmv bench ran at least one iteration")
+            .as_dtype(mlx_rs::Dtype::Float32)?;
+        stock.eval()?;
+        ferrite.eval()?;
+        let max_abs_diff = stock
+            .as_slice::<f32>()
+            .iter()
+            .zip(ferrite.as_slice::<f32>().iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f32, f32::max);
+
+        let stock_ms_per_iter = stock_elapsed_s * 1000.0 / f64::from(iterations);
+        let ferrite_ms_per_iter = ferrite_elapsed_s * 1000.0 / f64::from(iterations);
+        cases.push(Qmv4BenchCase {
+            m,
+            stock_ms_per_iter,
+            ferrite_ms_per_iter,
+            speedup: stock_ms_per_iter / ferrite_ms_per_iter.max(f64::EPSILON),
+            max_abs_diff,
+        });
+    }
+
+    Ok(Qmv4BenchResult {
+        k,
+        n,
+        group_size,
+        iterations,
+        warmup,
+        cases,
+    })
 }
 
 #[cfg(feature = "native-mlx")]

@@ -23,7 +23,7 @@ pub fn small_m_qmm4_enabled() -> bool {
 
 pub fn small_m_qmv4_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| env_flag("FERRITE_SMALL_M_QMV4", true))
+    *ENABLED.get_or_init(|| env_flag("FERRITE_SMALL_M_QMV4", false))
 }
 
 pub fn small_m_qmv4_strict() -> bool {
@@ -208,7 +208,22 @@ pub fn small_m_qmv4_matmul(
     x: &Array,
     linear: &crate::mlx_backend::QuantizedLinear,
 ) -> Result<Option<Array>> {
-    if !small_m_qmv4_is_eligible(x, linear) {
+    small_m_qmv4_matmul_impl(x, linear, true)
+}
+
+pub(crate) fn small_m_qmv4_matmul_for_bench(
+    x: &Array,
+    linear: &crate::mlx_backend::QuantizedLinear,
+) -> Result<Option<Array>> {
+    small_m_qmv4_matmul_impl(x, linear, false)
+}
+
+fn small_m_qmv4_matmul_impl(
+    x: &Array,
+    linear: &crate::mlx_backend::QuantizedLinear,
+    require_env_enabled: bool,
+) -> Result<Option<Array>> {
+    if !small_m_qmv4_is_eligible(x, linear, require_env_enabled) {
         return Ok(None);
     }
 
@@ -292,8 +307,12 @@ fn small_m_qmm4_is_eligible(x: &Array, linear: &crate::mlx_backend::QuantizedLin
     k == weight_shape[1] * 8 && k % 32 == 0 && n % 32 == 0
 }
 
-fn small_m_qmv4_is_eligible(x: &Array, linear: &crate::mlx_backend::QuantizedLinear) -> bool {
-    if !small_m_qmv4_enabled() || !metal_is_available() {
+fn small_m_qmv4_is_eligible(
+    x: &Array,
+    linear: &crate::mlx_backend::QuantizedLinear,
+    require_env_enabled: bool,
+) -> bool {
+    if (require_env_enabled && !small_m_qmv4_enabled()) || !metal_is_available() {
         return false;
     }
     if linear.bits != 4 || !matches!(linear.group_size, 32 | 64 | 128) {
@@ -1769,7 +1788,7 @@ mod tests {
                 4,
             )?
             .as_dtype(Dtype::Float32)?;
-            let actual = small_m_qmv4_matmul(&x, &linear)?
+            let actual = small_m_qmv4_matmul_for_bench(&x, &linear)?
                 .expect("small-m qmv4 should be eligible")
                 .as_dtype(Dtype::Float32)?;
             expected.eval()?;

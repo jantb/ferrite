@@ -35,6 +35,8 @@ pub enum Command {
     BenchInfer(BenchInferArgs),
     /// Benchmark greedy MTP draft acceptance against verified target decode.
     BenchMtp(BenchMtpArgs),
+    /// Benchmark the small-M qmv4 QuantizedLinear fast path.
+    BenchQmv4(BenchQmv4Args),
     /// Probe usable long-context prefill/decode windows.
     BenchContext(BenchContextArgs),
     /// Inspect Rust server state.
@@ -185,6 +187,24 @@ pub struct BenchMtpArgs {
 }
 
 #[derive(Args, Debug)]
+pub struct BenchQmv4Args {
+    #[arg(long, default_value = "1,3,6")]
+    pub m_values: String,
+    #[arg(long, default_value_t = 3584)]
+    pub k: i32,
+    #[arg(long, default_value_t = 8192)]
+    pub n: i32,
+    #[arg(long, default_value_t = 128)]
+    pub group_size: i32,
+    #[arg(long, default_value_t = 10)]
+    pub iterations: u32,
+    #[arg(long, default_value_t = 3)]
+    pub warmup: u32,
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Args, Debug)]
 pub struct BenchContextArgs {
     #[arg(long)]
     pub model: Option<String>,
@@ -219,6 +239,7 @@ pub fn run(cli: Cli) -> Result<()> {
         Command::BenchDecode(args) => bench_decode(args),
         Command::BenchInfer(args) => bench_infer(args),
         Command::BenchMtp(args) => bench_mtp(args),
+        Command::BenchQmv4(args) => bench_qmv4(args),
         Command::BenchContext(args) => bench_context(args),
         Command::Status(args) => status(args),
     }
@@ -525,6 +546,46 @@ fn bench_mtp(args: BenchMtpArgs) -> Result<()> {
         );
     }
     Ok(())
+}
+
+#[cfg(feature = "native-mlx")]
+fn bench_qmv4(args: BenchQmv4Args) -> Result<()> {
+    let m_values = parse_contexts(&args.m_values)?
+        .into_iter()
+        .map(|value| value as i32)
+        .collect::<Vec<_>>();
+    let result = crate::bench::run_qmv4_bench(
+        &m_values,
+        args.k,
+        args.n,
+        args.group_size,
+        args.iterations,
+        args.warmup,
+    )?;
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&result)?);
+    } else {
+        println!(
+            "qmv4 bench: K={} N={} group_size={} iterations={} warmup={}",
+            result.k, result.n, result.group_size, result.iterations, result.warmup
+        );
+        for case in result.cases {
+            println!(
+                "M={}: stock {:.3} ms, ferrite {:.3} ms, speedup {:.2}x, max_abs_diff {:.4}",
+                case.m,
+                case.stock_ms_per_iter,
+                case.ferrite_ms_per_iter,
+                case.speedup,
+                case.max_abs_diff
+            );
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "native-mlx"))]
+fn bench_qmv4(_args: BenchQmv4Args) -> Result<()> {
+    anyhow::bail!("bench-qmv4 requires the native-mlx feature")
 }
 
 fn bench_context(args: BenchContextArgs) -> Result<()> {

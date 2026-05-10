@@ -835,8 +835,6 @@ dependencies = [
 [[package]]
 name = "mlx-sys"
 version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2e3bc3880111918b2d5018f845d48fd995f9901f16efc81d1fcfd2f4210b8219"
 dependencies = [
  "bindgen",
  "cc",

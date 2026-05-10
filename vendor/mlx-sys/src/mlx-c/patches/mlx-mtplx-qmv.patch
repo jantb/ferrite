@@ -1,0 +1,46 @@
+diff --git a/mlx/backend/metal/quantized.cpp b/mlx/backend/metal/quantized.cpp
+index 0000000..0000000 100644
+--- a/mlx/backend/metal/quantized.cpp
++++ b/mlx/backend/metal/quantized.cpp
+@@ -210,9 +210,9 @@ void qmv(
+     const Stream& s) {
+   int B = out.size() / M / N;
+ 
+-  int bn = 8;
++  int bn = 16;
+   int bk = 32;
+-  MTL::Size group_dims(bk, 2, 1);
++  MTL::Size group_dims(bk, 4, 1);
+   MTL::Size grid_dims(M, (N + bn - 1) / bn, B);
+ 
+   std::string kname;
+diff --git a/mlx/backend/metal/kernels/quantized.h b/mlx/backend/metal/kernels/quantized.h
+index 0000000..0000000 100644
+--- a/mlx/backend/metal/kernels/quantized.h
++++ b/mlx/backend/metal/kernels/quantized.h
+@@ -637,7 +637,7 @@ METAL_FUNC void qmv_fast_impl(
+     uint simd_lid [[thread_index_in_simdgroup]]) {
+   constexpr int power_of_2_bits = (bits & (bits - 1)) == 0;
+   constexpr int packs_per_thread = bits == 2 ? 1 : 2;
+-  constexpr int num_simdgroups = 2;
++  constexpr int num_simdgroups = 4;
+   constexpr int results_per_simdgroup = 4;
+   constexpr int pack_factor = bits == 3 ? 8 : bits == 6 ? 4 : 32 / bits;
+   constexpr int bytes_per_pack = power_of_2_bits ? 4 : 3;
+@@ -663,6 +663,7 @@ METAL_FUNC void qmv_fast_impl(
+   x += tid.x * in_vec_size + simd_lid * values_per_thread;
+   y += tid.x * out_vec_size + out_row;
+ 
++#pragma clang loop unroll_count(4)
+   for (int k = 0; k < in_vec_size; k += block_size) {
+     U sum = load_vector<T, U, values_per_thread, bits>(x, x_thread);
+ 
+@@ -704,7 +705,7 @@ METAL_FUNC void qmv_impl(
+     uint simd_gid [[simdgroup_index_in_threadgroup]],
+     uint simd_lid [[thread_index_in_simdgroup]]) {
+   constexpr int power_of_2_bits = (bits & (bits - 1)) == 0;
+-  constexpr int num_simdgroups = 2;
++  constexpr int num_simdgroups = 4;
+   constexpr int results_per_simdgroup = 4;
+   constexpr int packs_per_thread = 1;
+   constexpr int pack_factor = bits == 3 ? 8 : bits == 6 ? 4 : 32 / bits;
