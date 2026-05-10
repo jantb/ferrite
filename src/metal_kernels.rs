@@ -428,4 +428,23 @@ mod tests {
 
         Ok(())
     }
+
+    #[test]
+    fn small_m_qmv4_m_value_selector_parses_lists() {
+        let selected = quantized::small_m_qmv4_m_values_from_str("1,4,5,6").unwrap();
+        assert!(selected[1]);
+        assert!(!selected[2]);
+        assert!(!selected[3]);
+        assert!(selected[4]);
+        assert!(selected[5]);
+        assert!(selected[6]);
+
+        let all = quantized::small_m_qmv4_m_values_from_str("all").unwrap();
+        assert!((1..=6).all(|m| all[m]));
+
+        let none = quantized::small_m_qmv4_m_values_from_str("off").unwrap();
+        assert!((1..=6).all(|m| !none[m]));
+
+        assert!(quantized::small_m_qmv4_m_values_from_str("7").is_none());
+    }
 }

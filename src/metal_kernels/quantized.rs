@@ -22,6 +22,60 @@ fn small_m_qmv4_max_m() -> i32 {
     *MAX_M.get_or_init(|| env_i32("FERRITE_SMALL_M_QMV4_MAX_M", 1).clamp(1, 6))
 }
 
+fn small_m_qmv4_m_enabled(m: i32) -> bool {
+    static VALUES: OnceLock<[bool; 7]> = OnceLock::new();
+    let values = VALUES.get_or_init(|| {
+        if let Ok(value) = std::env::var("FERRITE_SMALL_M_QMV4_M_VALUES") {
+            return small_m_qmv4_m_values_from_str(&value).unwrap_or(DEFAULT_SMALL_M_QMV4_M_VALUES);
+        }
+        if std::env::var_os("FERRITE_SMALL_M_QMV4_MAX_M").is_some() {
+            return small_m_qmv4_m_values_to_max(small_m_qmv4_max_m());
+        }
+        DEFAULT_SMALL_M_QMV4_M_VALUES
+    });
+    usize::try_from(m)
+        .ok()
+        .and_then(|index| values.get(index))
+        .copied()
+        .unwrap_or(false)
+}
+
+const DEFAULT_SMALL_M_QMV4_M_VALUES: [bool; 7] = [false, true, false, false, true, true, true];
+
+fn small_m_qmv4_m_values_to_max(max_m: i32) -> [bool; 7] {
+    let mut values = [false; 7];
+    for m in 1..=max_m.clamp(1, 6) {
+        values[m as usize] = true;
+    }
+    values
+}
+
+pub(super) fn small_m_qmv4_m_values_from_str(value: &str) -> Option<[bool; 7]> {
+    let normalized = value.trim().to_ascii_lowercase();
+    if matches!(normalized.as_str(), "all" | "true" | "yes" | "on") {
+        return Some(small_m_qmv4_m_values_to_max(6));
+    }
+    if matches!(normalized.as_str(), "none" | "0" | "false" | "no" | "off") {
+        return Some([false; 7]);
+    }
+
+    let mut values = [false; 7];
+    let mut any = false;
+    for part in normalized.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        let m = part.parse::<usize>().ok()?;
+        if !(1..=6).contains(&m) {
+            return None;
+        }
+        values[m] = true;
+        any = true;
+    }
+    any.then_some(values)
+}
+
 fn small_m_qmv4_simdgroups() -> i32 {
     static SIMDGROUPS: OnceLock<i32> = OnceLock::new();
     *SIMDGROUPS
@@ -363,7 +417,7 @@ fn small_m_qmv4_is_eligible(
     if !(1..=6).contains(&m) {
         return false;
     }
-    if require_env_enabled && m > small_m_qmv4_max_m() {
+    if require_env_enabled && !small_m_qmv4_m_enabled(m) {
         return false;
     }
     let leading_batch = shape[..shape.len() - 2].iter().copied().product::<i32>();
