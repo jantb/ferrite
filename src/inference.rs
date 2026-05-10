@@ -1251,6 +1251,7 @@ fn prepare_prompt_state(
                 }
             }
             state.clear_transient_block_states();
+            eval_prepared_prompt_state(&state, &logits, &hidden, &mtp_history_state)?;
             let prefill_s = started.elapsed().as_secs_f64();
             maybe_store_prompt_cache(
                 session,
@@ -1291,6 +1292,7 @@ fn prepare_prompt_state(
         session.qwen.new_mtp_decode_state().unwrap_or_default()
     };
     state.clear_transient_block_states();
+    eval_prepared_prompt_state(&state, &logits, &hidden, &mtp_history_state)?;
     let prefill_s = started.elapsed().as_secs_f64();
     maybe_store_prompt_cache(
         session,
@@ -1371,6 +1373,57 @@ fn maybe_store_prompt_cache(
         ),
     });
     evict_prompt_caches(session, max_entries, prefix_cache_max_bytes());
+}
+
+#[cfg(feature = "native-mlx")]
+fn eval_prepared_prompt_state(
+    state: &crate::qwen36::DecodeState,
+    logits: &mlx_rs::Array,
+    hidden: &mlx_rs::Array,
+    mtp_history_state: &crate::qwen36::MtpDecodeState,
+) -> Result<()> {
+    logits.eval()?;
+    hidden.eval()?;
+    eval_decode_state(state)?;
+    eval_mtp_decode_state(mtp_history_state)?;
+    clear_mlx_cache();
+    Ok(())
+}
+
+#[cfg(feature = "native-mlx")]
+fn eval_decode_state(state: &crate::qwen36::DecodeState) -> Result<()> {
+    for layer in &state.layers {
+        match layer {
+            crate::qwen36::LayerDecodeState::Full(cache) => {
+                eval_full_attention_cache(cache)?;
+            }
+            crate::qwen36::LayerDecodeState::Linear(cache) => {
+                if let Some(array) = &cache.metal_conv_state {
+                    array.eval()?;
+                }
+                if let Some(array) = &cache.metal_recurrent_state {
+                    array.eval()?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "native-mlx")]
+fn eval_mtp_decode_state(state: &crate::qwen36::MtpDecodeState) -> Result<()> {
+    eval_full_attention_cache(&state.cache)
+}
+
+#[cfg(feature = "native-mlx")]
+fn eval_full_attention_cache(cache: &crate::qwen36::FullAttentionCache) -> Result<()> {
+    if let Some(array) = &cache.k {
+        array.eval()?;
+    }
+    if let Some(array) = &cache.v {
+        array.eval()?;
+    }
+    Ok(())
 }
 
 #[cfg(feature = "native-mlx")]
