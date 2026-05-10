@@ -173,7 +173,7 @@ pub use mtp::{MtpDecodeState, MtpWeights};
 mod load;
 
 #[cfg(feature = "native-mlx")]
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize)]
 pub struct DecodeProfileTimings {
     pub blocks: u32,
     pub tokens: u32,

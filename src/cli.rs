@@ -33,6 +33,8 @@ pub enum Command {
     BenchDecode(BenchDecodeArgs),
     /// Benchmark the same inference path used by the server.
     BenchInfer(BenchInferArgs),
+    /// Profile a native prefill block by layer category.
+    BenchPrefillProfile(BenchPrefillProfileArgs),
     /// Benchmark greedy MTP draft acceptance against verified target decode.
     BenchMtp(BenchMtpArgs),
     /// Benchmark the small-M qmv4 QuantizedLinear fast path.
@@ -171,6 +173,26 @@ pub struct BenchInferArgs {
 }
 
 #[derive(Args, Debug)]
+pub struct BenchPrefillProfileArgs {
+    #[arg(long)]
+    pub model: Option<String>,
+    #[arg(long, default_value = "hi")]
+    pub prompt: String,
+    #[arg(long)]
+    pub prompt_file: Option<PathBuf>,
+    #[arg(long, default_value_t = 1000)]
+    pub prompt_repeat: usize,
+    #[arg(long, default_value_t = 128)]
+    pub profile_tokens: u32,
+    #[arg(long, default_value_t = 1)]
+    pub iterations: u32,
+    #[arg(long, default_value_t = 0)]
+    pub warmup: u32,
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Args, Debug)]
 pub struct BenchMtpArgs {
     #[arg(long)]
     pub model: Option<String>,
@@ -242,6 +264,7 @@ pub fn run(cli: Cli) -> Result<()> {
         Command::BenchNative(args) => bench_native(args),
         Command::BenchDecode(args) => bench_decode(args),
         Command::BenchInfer(args) => bench_infer(args),
+        Command::BenchPrefillProfile(args) => bench_prefill_profile(args),
         Command::BenchMtp(args) => bench_mtp(args),
         Command::BenchQmv4(args) => bench_qmv4(args),
         Command::BenchContext(args) => bench_context(args),
@@ -517,6 +540,53 @@ fn bench_infer(args: BenchInferArgs) -> Result<()> {
         println!("prefill tok/s: {:.1}", result.prefill_tokens_per_s);
         println!("output tok/s: {:.3}", result.output_tokens_per_s);
         println!("completion tokens: {}", result.completion_tokens);
+    }
+    Ok(())
+}
+
+fn bench_prefill_profile(args: BenchPrefillProfileArgs) -> Result<()> {
+    let model_ref = args.model.unwrap_or_else(|| DEFAULT_MODEL.to_string());
+    let mut prompt = prompt_from_args(Some(args.prompt), args.prompt_file)?;
+    if args.prompt_repeat > 1 {
+        prompt = std::iter::repeat_n(prompt, args.prompt_repeat)
+            .collect::<Vec<_>>()
+            .join("\n");
+    }
+    let result = crate::bench::run_prefill_profile_bench(
+        &model_ref,
+        &prompt,
+        args.profile_tokens,
+        args.iterations,
+        args.warmup,
+    )?;
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&result)?);
+    } else {
+        println!("model: {}", result.model);
+        println!("prompt tokens: {}", result.prompt_tokens);
+        println!("profiled tokens: {}", result.profiled_tokens);
+        println!(
+            "iterations: {} (+{} warmup)",
+            result.iterations, result.warmup
+        );
+        println!("avg total: {:.3}s", result.avg_total_s);
+        println!("tokens/s: {:.1}", result.tokens_per_s);
+        println!(
+            "full attention: {:.3}s ({:.1}%)",
+            result.full_attention_s, result.full_attention_pct
+        );
+        println!(
+            "linear attention: {:.3}s ({:.1}%)",
+            result.linear_attention_s, result.linear_attention_pct
+        );
+        println!("mlp: {:.3}s ({:.1}%)", result.mlp_s, result.mlp_pct);
+        println!(
+            "layer glue: {:.3}s ({:.1}%)",
+            result.layer_glue_s, result.layer_glue_pct
+        );
+        println!("embedding: {:.3}s", result.embedding_s);
+        println!("final norm: {:.3}s", result.final_norm_s);
+        println!("lm head: {:.3}s", result.lm_head_s);
     }
     Ok(())
 }

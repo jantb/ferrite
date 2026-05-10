@@ -63,6 +63,28 @@ pub struct InferPathBenchResult {
 }
 
 #[derive(Clone, Debug, Serialize)]
+pub struct PrefillProfileBenchResult {
+    pub model: String,
+    pub prompt_tokens: usize,
+    pub profiled_tokens: u32,
+    pub iterations: u32,
+    pub warmup: u32,
+    pub avg_total_s: f64,
+    pub tokens_per_s: f64,
+    pub embedding_s: f64,
+    pub full_attention_s: f64,
+    pub linear_attention_s: f64,
+    pub mlp_s: f64,
+    pub layer_glue_s: f64,
+    pub final_norm_s: f64,
+    pub lm_head_s: f64,
+    pub full_attention_pct: f64,
+    pub linear_attention_pct: f64,
+    pub mlp_pct: f64,
+    pub layer_glue_pct: f64,
+}
+
+#[derive(Clone, Debug, Serialize)]
 pub struct MtpBenchResult {
     pub model: String,
     pub prompt_tokens: usize,
@@ -596,6 +618,100 @@ pub fn run_infer_path_bench(
         output_tokens_per_s: f64::from(completion_tokens) / avg_decode_s.max(f64::EPSILON),
         completion_tokens,
         backend: backend_name,
+    })
+}
+
+#[cfg(feature = "native-mlx")]
+pub fn run_prefill_profile_bench(
+    model_ref: &str,
+    prompt: &str,
+    profile_tokens: u32,
+    iterations: u32,
+    warmup: u32,
+) -> Result<PrefillProfileBenchResult> {
+    let model = crate::model::LoadedModel::load(model_ref)?;
+    let request = crate::inference::InferenceRequest {
+        model: model_ref.to_string(),
+        prompt: prompt.to_string(),
+        system: None,
+        messages: Vec::new(),
+        stop: Vec::new(),
+        max_tokens: Some(1),
+        temperature: 0.0,
+        top_p: 1.0,
+        top_k: 1,
+        depth: 0,
+        mtp: false,
+        requested_context_tokens: None,
+        profile_timings: true,
+    };
+    let prompt_ids = model.encode_prompt(&request)?;
+    anyhow::ensure!(!prompt_ids.is_empty(), "prompt produced no tokens");
+    let profiled_len = usize::min(profile_tokens.max(1) as usize, prompt_ids.len());
+    let block = &prompt_ids[..profiled_len];
+
+    let weights = crate::mlx_backend::MlxWeightStore::load_model_dir(&model.path, &model.tensors)?;
+    let qwen = crate::qwen36::Qwen36Weights::from_loaded(&model, &weights)?;
+    let plan = crate::qwen36::Qwen36Plan::from_model(&model)?;
+
+    for _ in 0..warmup {
+        let mut state = qwen.new_decode_state(&plan)?;
+        let (logits, hidden, _profile) =
+            qwen.decode_tokens_logits_with_hidden_profiled(block, &plan, &mut state)?;
+        logits.eval()?;
+        hidden.eval()?;
+    }
+
+    let passes = iterations.max(1);
+    let mut total_s = 0.0_f64;
+    let mut profile_sum = crate::qwen36::DecodeProfileTimings::default();
+    for _ in 0..passes {
+        let mut state = qwen.new_decode_state(&plan)?;
+        let started = Instant::now();
+        let (logits, hidden, profile) =
+            qwen.decode_tokens_logits_with_hidden_profiled(block, &plan, &mut state)?;
+        logits.eval()?;
+        hidden.eval()?;
+        total_s += started.elapsed().as_secs_f64();
+        profile_sum.blocks += profile.blocks;
+        profile_sum.tokens += profile.tokens;
+        profile_sum.embedding_s += profile.embedding_s;
+        profile_sum.full_attention_s += profile.full_attention_s;
+        profile_sum.linear_attention_s += profile.linear_attention_s;
+        profile_sum.mlp_s += profile.mlp_s;
+        profile_sum.layer_glue_s += profile.layer_glue_s;
+        profile_sum.final_norm_s += profile.final_norm_s;
+        profile_sum.lm_head_s += profile.lm_head_s;
+    }
+
+    let divisor = f64::from(passes);
+    let avg_total_s = total_s / divisor;
+    let embedding_s = profile_sum.embedding_s / divisor;
+    let full_attention_s = profile_sum.full_attention_s / divisor;
+    let linear_attention_s = profile_sum.linear_attention_s / divisor;
+    let mlp_s = profile_sum.mlp_s / divisor;
+    let layer_glue_s = profile_sum.layer_glue_s / divisor;
+    let final_norm_s = profile_sum.final_norm_s / divisor;
+    let lm_head_s = profile_sum.lm_head_s / divisor;
+    Ok(PrefillProfileBenchResult {
+        model: model_ref.to_string(),
+        prompt_tokens: prompt_ids.len(),
+        profiled_tokens: profiled_len as u32,
+        iterations: passes,
+        warmup,
+        avg_total_s,
+        tokens_per_s: profiled_len as f64 / avg_total_s.max(f64::EPSILON),
+        embedding_s,
+        full_attention_s,
+        linear_attention_s,
+        mlp_s,
+        layer_glue_s,
+        final_norm_s,
+        lm_head_s,
+        full_attention_pct: full_attention_s / avg_total_s.max(f64::EPSILON) * 100.0,
+        linear_attention_pct: linear_attention_s / avg_total_s.max(f64::EPSILON) * 100.0,
+        mlp_pct: mlp_s / avg_total_s.max(f64::EPSILON) * 100.0,
+        layer_glue_pct: layer_glue_s / avg_total_s.max(f64::EPSILON) * 100.0,
     })
 }
 
