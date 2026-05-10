@@ -17,6 +17,8 @@ use serde::{Deserialize, Serialize};
 const DEFAULT_MAX_KV_CONTEXT_TOKENS: usize = 16_384;
 #[cfg(feature = "native-mlx")]
 const DEFAULT_MLX_CACHE_LIMIT_BYTES: usize = 512 * 1024 * 1024;
+#[cfg(feature = "native-mlx")]
+const DEFAULT_MLX_MEMORY_LIMIT_BYTES: usize = 8 * 1024 * 1024 * 1024;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct InferenceRequest {
@@ -209,6 +211,7 @@ impl NativeMlxBackend {
     #[cfg(feature = "native-mlx")]
     pub fn preload(&self, model_ref: &str) -> Result<f64> {
         let _memory_guard = RequestMemoryGuard::new("preload");
+        check_kill_switch("preload_start")?;
         let started = Instant::now();
         let mut cache = self.cache.borrow_mut();
         let needs_load = cache
@@ -221,6 +224,7 @@ impl NativeMlxBackend {
         if memory_trace_enabled() {
             log_memory_sample("preload", "after_load", &format!("model={model_ref}"));
         }
+        check_kill_switch("preload_after_load")?;
         Ok(started.elapsed().as_secs_f64())
     }
 
@@ -298,25 +302,46 @@ fn memory_trace_enabled() -> bool {
 fn configure_mlx_memory_once() {
     static CONFIGURE: Once = Once::new();
     CONFIGURE.call_once(|| {
-        let limit = ferrite_env_var("MTPLX_MLX_CACHE_LIMIT_BYTES")
+        let memory_limit = ferrite_env_var("MTPLX_MLX_MEMORY_LIMIT_BYTES")
+            .ok()
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .unwrap_or(DEFAULT_MLX_MEMORY_LIMIT_BYTES);
+        if memory_limit > 0 {
+            let mut previous = 0_usize;
+            let status = unsafe { mlx_sys::mlx_set_memory_limit(&mut previous, memory_limit) };
+            if status != 0 {
+                let _ = append_memory_log_line(
+                    "ferrite_memory phase=configure_mlx_memory_limit status=error",
+                );
+            } else if memory_trace_enabled() {
+                let line = format!(
+                    "ferrite_memory phase=configure_mlx_memory_limit limit_bytes={memory_limit} previous_bytes={previous}"
+                );
+                let _ = append_memory_log_line(&line);
+                if env_flag("MTPLX_MEMORY_TRACE_STDERR", false) {
+                    eprintln!("{line}");
+                }
+            }
+        }
+
+        let cache_limit = ferrite_env_var("MTPLX_MLX_CACHE_LIMIT_BYTES")
             .ok()
             .and_then(|value| value.trim().parse::<usize>().ok())
             .unwrap_or(DEFAULT_MLX_CACHE_LIMIT_BYTES);
-        if limit > 0 {
+        if cache_limit > 0 {
             let mut previous = 0_usize;
-            let status = unsafe { mlx_sys::mlx_set_cache_limit(&mut previous, limit) };
+            let status = unsafe { mlx_sys::mlx_set_cache_limit(&mut previous, cache_limit) };
             if status != 0 {
                 let _ = append_memory_log_line(
                     "ferrite_memory phase=configure_mlx_cache_limit status=error",
                 );
             } else if memory_trace_enabled() {
-                let _ = append_memory_log_line(&format!(
-                    "ferrite_memory phase=configure_mlx_cache_limit limit_bytes={limit} previous_bytes={previous}"
-                ));
+                let line = format!(
+                    "ferrite_memory phase=configure_mlx_cache_limit limit_bytes={cache_limit} previous_bytes={previous}"
+                );
+                let _ = append_memory_log_line(&line);
                 if env_flag("MTPLX_MEMORY_TRACE_STDERR", false) {
-                    eprintln!(
-                        "ferrite_memory phase=configure_mlx_cache_limit limit_bytes={limit} previous_bytes={previous}"
-                    );
+                    eprintln!("{line}");
                 }
             }
         }
@@ -401,6 +426,64 @@ fn request_memory_details(
             "disabled"
         }
     )
+}
+
+#[cfg(feature = "native-mlx")]
+fn check_kill_switch(phase: &str) -> Result<()> {
+    if kill_switch_path().exists() {
+        log_memory_sample("kill_switch", phase, "reason=file");
+        anyhow::bail!(
+            "Ferrite kill switch is active; remove {} to resume",
+            kill_switch_path().display()
+        );
+    }
+    if let Some(limit) = rss_kill_limit_bytes()
+        && let Some(rss) = process_rss_bytes()
+        && rss > limit
+    {
+        log_memory_sample(
+            "kill_switch",
+            phase,
+            &format!("reason=rss rss_bytes={rss} limit_bytes={limit}"),
+        );
+        clear_mlx_cache();
+        anyhow::bail!("Ferrite RSS kill switch tripped: rss={rss} limit={limit}");
+    }
+    Ok(())
+}
+
+#[cfg(feature = "native-mlx")]
+fn kill_switch_path() -> PathBuf {
+    ferrite_env_var("MTPLX_KILL_SWITCH_FILE")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("ferrite-kill-switch"))
+}
+
+#[cfg(feature = "native-mlx")]
+fn rss_kill_limit_bytes() -> Option<u64> {
+    match ferrite_env_var("MTPLX_RSS_KILL_BYTES") {
+        Ok(value) => value.trim().parse::<u64>().ok().filter(|value| *value > 0),
+        Err(_) => physical_memory_bytes().map(|bytes| bytes.saturating_mul(75) / 100),
+    }
+}
+
+#[cfg(feature = "native-mlx")]
+fn physical_memory_bytes() -> Option<u64> {
+    let mut value = 0_u64;
+    let mut size = std::mem::size_of::<u64>();
+    let name = c"hw.memsize";
+    let status = unsafe {
+        libc::sysctlbyname(
+            name.as_ptr(),
+            (&mut value as *mut u64).cast::<libc::c_void>(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    (status == 0 && value > 0).then_some(value)
 }
 
 #[cfg(feature = "native-mlx")]
@@ -606,6 +689,7 @@ fn generate_mtp(
     };
 
     while completion_ids.len() < max_tokens as usize {
+        check_kill_switch("generate_mtp_loop")?;
         let primary = match pending_primary.take() {
             Some(token) => token,
             None => {
@@ -1095,6 +1179,7 @@ fn generate_target_tail(
 ) -> Result<GenerationOutput> {
     let mut finish_reason = FinishReason::Length;
     while completion_ids.len() < max_tokens as usize {
+        check_kill_switch("generate_target_tail_loop")?;
         let next = crate::sampling::distribution_from_logits(&logits, sampling)?.sample()?;
         if eos_token_ids.contains(&next) {
             finish_reason = FinishReason::Stop;
@@ -1775,6 +1860,7 @@ impl NativeMlxBackend {
         #[cfg(feature = "native-mlx")]
         {
             let _memory_guard = RequestMemoryGuard::new("infer");
+            check_kill_switch("infer_start")?;
             let load_started = Instant::now();
             let mut cache = self.cache.borrow_mut();
             let needs_load = cache
@@ -1795,6 +1881,7 @@ impl NativeMlxBackend {
                     &request_memory_details(request, None, None),
                 );
             }
+            check_kill_switch("infer_after_load")?;
             let prompt_ids = session.model.encode_prompt(request)?;
             let max_tokens = bounded_max_tokens(
                 prompt_ids.len(),
@@ -1808,6 +1895,7 @@ impl NativeMlxBackend {
                     &request_memory_details(request, Some(prompt_ids.len()), Some(max_tokens)),
                 );
             }
+            check_kill_switch("infer_after_tokenize")?;
             let eos_token_ids = session.model.eos_token_ids();
             let sampling = crate::sampling::SamplingConfig {
                 temperature: request.temperature,
@@ -1822,6 +1910,7 @@ impl NativeMlxBackend {
             let mut post_generation_cache_base = None;
             let decode_started = Instant::now();
             if max_tokens > 0 {
+                check_kill_switch("infer_before_prefill")?;
                 let prepared = prepare_prompt_state(session, request, &prompt_ids)?;
                 let mut state = prepared.state;
                 let logits = prepared.logits;
@@ -1837,6 +1926,7 @@ impl NativeMlxBackend {
                         &request_memory_details(request, Some(prompt_ids.len()), Some(max_tokens)),
                     );
                 }
+                check_kill_switch("infer_after_prefill")?;
                 if request.mtp && request.depth > 0 && session.qwen.mtp.is_some() {
                     let post_generation_cache_base = post_generation_cache_enabled()
                         .then(|| (state.clone(), hidden.clone(), mtp_history_state.clone()));
@@ -1962,6 +2052,7 @@ impl NativeMlxBackend {
                     finish_reason = FinishReason::Stop;
                 }
                 for _ in 1..max_tokens {
+                    check_kill_switch("infer_decode_loop")?;
                     if stopped_text.is_some() {
                         break;
                     }
