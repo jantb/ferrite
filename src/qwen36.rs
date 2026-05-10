@@ -249,6 +249,11 @@ impl FullAttentionCache {
         k: mlx_rs::Array,
         v: mlx_rs::Array,
     ) -> Result<(mlx_rs::Array, mlx_rs::Array, i32)> {
+        let prev = self.append_without_fetch(k, v)?;
+        Ok((self.active_k()?, self.active_v()?, prev))
+    }
+
+    pub fn append_without_fetch(&mut self, k: mlx_rs::Array, v: mlx_rs::Array) -> Result<i32> {
         let k_shape = k.shape();
         let v_shape = v.shape();
         if k_shape.len() != 4 || v_shape.len() != 4 {
@@ -284,9 +289,9 @@ impl FullAttentionCache {
                 _ => v,
             };
             self.offset = end;
-            self.k = Some(next_k.clone());
-            self.v = Some(next_v.clone());
-            return Ok((next_k, next_v, prev));
+            self.k = Some(next_k);
+            self.v = Some(next_v);
+            return Ok(prev);
         }
         self.ensure_capacity(end, &k, &v)?;
         self.k
@@ -298,7 +303,37 @@ impl FullAttentionCache {
             .expect("full-attention value cache was just allocated")
             .try_index_mut((.., .., prev..end, ..), v)?;
         self.offset = end;
-        Ok((self.active_k()?, self.active_v()?, prev))
+        Ok(prev)
+    }
+
+    pub fn active_block_slices(
+        &self,
+        block_tokens: i32,
+    ) -> Result<Vec<(i32, mlx_rs::Array, mlx_rs::Array)>> {
+        if block_tokens <= 0 {
+            bail!("full-attention block size must be positive, got {block_tokens}");
+        }
+        let k = self
+            .k
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("missing full-attention key cache"))?;
+        let v = self
+            .v
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("missing full-attention value cache"))?;
+        let len = self.current_len();
+        let mut blocks = Vec::new();
+        let mut start = 0;
+        while start < len {
+            let end = (start + block_tokens).min(len);
+            blocks.push((
+                start,
+                k.index((.., .., start..end, ..)),
+                v.index((.., .., start..end, ..)),
+            ));
+            start = end;
+        }
+        Ok(blocks)
     }
 
     fn ensure_capacity(
@@ -1083,16 +1118,23 @@ impl FullAttentionWeights {
             offset,
             None,
         )?;
-        let (active_k, active_v, prev_len) = cache.append_and_fetch(k, projected.v)?;
-        let total_keys = active_k.shape()[2];
         let scale = 1.0 / (head_dim as f32).sqrt();
-        let attended = if let Some(chunk) = split_full_attention_chunk_tokens(tokens, prev_len) {
-            split_decode_scaled_dot_product_attention(
-                &q, &active_k, &active_v, tokens, prev_len, chunk, scale,
-            )?
+        let prev_len = cache.current_len();
+        let attended = if blockwise_full_attention_enabled(tokens, prev_len) {
+            let prev_len = cache.append_without_fetch(k, projected.v)?;
+            let blocks = cache.active_block_slices(blockwise_full_attention_block_tokens())?;
+            blockwise_decode_scaled_dot_product_attention(&q, &blocks, tokens, prev_len, scale)?
         } else {
-            let mask = decode_block_causal_mask(tokens, total_keys, prev_len, q.dtype())?;
-            mlx_rs::fast::scaled_dot_product_attention(&q, &active_k, &active_v, scale, &mask)?
+            let (active_k, active_v, prev_len) = cache.append_and_fetch(k, projected.v)?;
+            let total_keys = active_k.shape()[2];
+            if let Some(chunk) = split_full_attention_chunk_tokens(tokens, prev_len) {
+                split_decode_scaled_dot_product_attention(
+                    &q, &active_k, &active_v, tokens, prev_len, chunk, scale,
+                )?
+            } else {
+                let mask = decode_block_causal_mask(tokens, total_keys, prev_len, q.dtype())?;
+                mlx_rs::fast::scaled_dot_product_attention(&q, &active_k, &active_v, scale, &mask)?
+            }
         };
         let merged = attended.transpose_axes(&[0, 2, 1, 3])?.reshape(&[
             batch,
@@ -1102,6 +1144,160 @@ impl FullAttentionWeights {
         let merged = apply_attention_gate(merged, projected.gate.as_ref())?;
         self.o_proj.forward(&merged)
     }
+}
+
+#[cfg(feature = "native-mlx")]
+fn blockwise_full_attention_enabled(tokens: i32, prev_len: i32) -> bool {
+    let enabled = std::env::var("FERRITE_BLOCKWISE_FULL_ATTN")
+        .ok()
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false);
+    if !enabled {
+        return false;
+    }
+    let threshold = std::env::var("FERRITE_BLOCKWISE_FULL_ATTN_THRESHOLD")
+        .ok()
+        .and_then(|value| value.trim().parse::<i32>().ok())
+        .filter(|value| *value >= 0)
+        .unwrap_or(1024);
+    tokens > 1 && prev_len >= threshold
+}
+
+#[cfg(feature = "native-mlx")]
+fn blockwise_full_attention_block_tokens() -> i32 {
+    std::env::var("FERRITE_BLOCKWISE_FULL_ATTN_BLOCK_TOKENS")
+        .ok()
+        .and_then(|value| value.trim().parse::<i32>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(512)
+}
+
+#[cfg(feature = "native-mlx")]
+fn blockwise_decode_scaled_dot_product_attention(
+    q: &mlx_rs::Array,
+    blocks: &[(i32, mlx_rs::Array, mlx_rs::Array)],
+    tokens: i32,
+    prev_len: i32,
+    scale: f32,
+) -> Result<mlx_rs::Array> {
+    if blocks.is_empty() {
+        bail!("blockwise attention requires at least one cache block");
+    }
+    let shape = q.shape();
+    if shape.len() != 4 {
+        bail!("blockwise attention query must be [batch, heads, tokens, dim], got {shape:?}");
+    }
+    let batch = shape[0];
+    let query_heads = shape[1];
+    let head_dim = shape[3];
+    let first_k_shape = blocks[0].1.shape();
+    let first_v_shape = blocks[0].2.shape();
+    if first_k_shape.len() != 4 || first_v_shape.len() != 4 {
+        bail!("blockwise attention cache must be [batch, heads, tokens, dim]");
+    }
+    let kv_heads = first_k_shape[1];
+    if kv_heads <= 0 || query_heads % kv_heads != 0 {
+        bail!("query heads {query_heads} must be divisible by key/value heads {kv_heads}");
+    }
+    let repeat = query_heads / kv_heads;
+    let q_float = q.as_dtype(mlx_rs::Dtype::Float32)?;
+    let mut running_max: Option<mlx_rs::Array> = None;
+    let mut running_denom: Option<mlx_rs::Array> = None;
+    let mut running_acc: Option<mlx_rs::Array> = None;
+
+    for (start, k_block, v_block) in blocks {
+        let k_shape = k_block.shape();
+        let v_shape = v_block.shape();
+        if k_shape.len() != 4 || v_shape.len() != 4 || k_shape != v_shape {
+            bail!("blockwise attention cache block shape mismatch: {k_shape:?} vs {v_shape:?}");
+        }
+        let block_len = k_shape[2];
+        let k_block = k_block.as_dtype(mlx_rs::Dtype::Float32)?;
+        let v_block = v_block.as_dtype(mlx_rs::Dtype::Float32)?;
+        let scores = if repeat > 1 {
+            let q_grouped = q_float.reshape(&[batch, kv_heads, repeat, tokens, head_dim])?;
+            let k_grouped = k_block.reshape(&[batch, kv_heads, 1, block_len, head_dim])?;
+            q_grouped
+                .matmul(&k_grouped.transpose_axes(&[0, 1, 2, 4, 3])?)?
+                .reshape(&[batch, query_heads, tokens, block_len])?
+        } else {
+            q_float.matmul(&k_block.transpose_axes(&[0, 1, 3, 2])?)?
+        };
+        let mut scores = scores.multiply(&mlx_rs::Array::from_f32(scale))?;
+        if *start + block_len > prev_len {
+            let mask = causal_position_mask(tokens, block_len, prev_len, *start, scores.dtype())?;
+            scores = scores.add(&mask)?;
+        }
+        let local_max = scores.max_axis(-1, Some(true))?;
+        let weights = scores.subtract(&local_max)?.exp()?;
+        let local_denom = weights.sum_axis(-1, Some(true))?;
+        let local_acc = if repeat > 1 {
+            weights
+                .reshape(&[batch, kv_heads, repeat, tokens, block_len])?
+                .matmul(&v_block.reshape(&[batch, kv_heads, 1, block_len, head_dim])?)?
+                .reshape(&[batch, query_heads, tokens, head_dim])?
+        } else {
+            weights.matmul(&v_block)?
+        };
+
+        match (running_max.take(), running_denom.take(), running_acc.take()) {
+            (Some(prev_max), Some(prev_denom), Some(prev_acc)) => {
+                let new_max = mlx_rs::ops::maximum(&prev_max, &local_max)?;
+                let old_scale = prev_max.subtract(&new_max)?.exp()?;
+                let new_scale = local_max.subtract(&new_max)?.exp()?;
+                running_acc = Some(
+                    prev_acc
+                        .multiply(&old_scale)?
+                        .add(&local_acc.multiply(&new_scale)?)?,
+                );
+                running_denom = Some(
+                    prev_denom
+                        .multiply(&old_scale)?
+                        .add(&local_denom.multiply(&new_scale)?)?,
+                );
+                running_max = Some(new_max);
+            }
+            _ => {
+                running_max = Some(local_max);
+                running_denom = Some(local_denom);
+                running_acc = Some(local_acc);
+            }
+        }
+    }
+
+    let acc =
+        running_acc.ok_or_else(|| anyhow::anyhow!("blockwise attention produced no output"))?;
+    let denom =
+        running_denom.ok_or_else(|| anyhow::anyhow!("blockwise attention produced no denom"))?;
+    Ok(acc.divide(&denom)?.as_dtype(q.dtype())?)
+}
+
+#[cfg(feature = "native-mlx")]
+fn causal_position_mask(
+    tokens: i32,
+    block_len: i32,
+    query_start: i32,
+    key_start: i32,
+    dtype: mlx_rs::Dtype,
+) -> Result<mlx_rs::Array> {
+    let mut values = Vec::with_capacity((tokens * block_len) as usize);
+    for query in 0..tokens {
+        let query_position = query_start + query;
+        for key in 0..block_len {
+            let key_position = key_start + key;
+            values.push(if key_position <= query_position {
+                0.0_f32
+            } else {
+                -1.0e9_f32
+            });
+        }
+    }
+    Ok(mlx_rs::Array::from_slice(&values, &[1, 1, tokens, block_len]).as_dtype(dtype)?)
 }
 
 #[cfg(feature = "native-mlx")]
@@ -2212,8 +2408,13 @@ impl Qwen36Weights {
         let input = input_ids.iter().map(|id| *id as i32).collect::<Vec<_>>();
         let input_ids = mlx_rs::Array::from_slice(&input, &[1, input.len() as i32]);
         let mut hidden = self.embeddings.forward(&input_ids)?;
-        for (layer, cache) in self.layers.iter().zip(state.layers.iter_mut()) {
+        let eval_interval = prefill_layer_eval_interval();
+        for (index, (layer, cache)) in self.layers.iter().zip(state.layers.iter_mut()).enumerate() {
             hidden = layer.forward_decode_tokens(&hidden, plan, state.position, cache)?;
+            if should_eval_prefill_layer(index, eval_interval) {
+                hidden.eval()?;
+                eval_layer_decode_state(cache)?;
+            }
         }
         state.position += input.len() as i32;
         let last = input.len() as i32 - 1;
@@ -2236,8 +2437,13 @@ impl Qwen36Weights {
         let input = input_ids.iter().map(|id| *id as i32).collect::<Vec<_>>();
         let input_ids = mlx_rs::Array::from_slice(&input, &[1, input.len() as i32]);
         let mut hidden = self.embeddings.forward(&input_ids)?;
-        for (layer, cache) in self.layers.iter().zip(state.layers.iter_mut()) {
+        let eval_interval = prefill_layer_eval_interval();
+        for (index, (layer, cache)) in self.layers.iter().zip(state.layers.iter_mut()).enumerate() {
             hidden = layer.forward_decode_tokens(&hidden, plan, state.position, cache)?;
+            if should_eval_prefill_layer(index, eval_interval) {
+                hidden.eval()?;
+                eval_layer_decode_state(cache)?;
+            }
         }
         state.position += input.len() as i32;
         Ok(())
@@ -2283,6 +2489,48 @@ pub(crate) fn array_to_f32_vec(array: &mlx_rs::Array) -> Result<Vec<f32>> {
     let array = array.as_type::<f32>()?;
     array.eval()?;
     Ok(array.as_slice::<f32>().to_vec())
+}
+
+#[cfg(feature = "native-mlx")]
+fn prefill_layer_eval_interval() -> usize {
+    std::env::var("FERRITE_PREFILL_EVAL_LAYER_INTERVAL")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .unwrap_or(0)
+}
+
+#[cfg(feature = "native-mlx")]
+fn should_eval_prefill_layer(layer_index: usize, interval: usize) -> bool {
+    interval > 0 && (layer_index + 1).is_multiple_of(interval)
+}
+
+#[cfg(feature = "native-mlx")]
+fn eval_layer_decode_state(cache: &LayerDecodeState) -> Result<()> {
+    match cache {
+        LayerDecodeState::Full(cache) => {
+            if let Some(array) = &cache.k {
+                array.eval()?;
+            }
+            if let Some(array) = &cache.v {
+                array.eval()?;
+            }
+        }
+        LayerDecodeState::Linear(cache) => {
+            if let Some(array) = &cache.metal_conv_state {
+                array.eval()?;
+            }
+            if let Some(array) = &cache.metal_recurrent_state {
+                array.eval()?;
+            }
+            if let Some(array) = &cache.metal_conv_block_states {
+                array.eval()?;
+            }
+            if let Some(array) = &cache.metal_recurrent_block_states {
+                array.eval()?;
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(feature = "native-mlx")]
