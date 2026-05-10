@@ -401,11 +401,37 @@ impl LinearAttentionWeights {
         };
 
         let z = z.reshape(&[batch, tokens, hv, dv])?;
-        let gate = mlx_rs::nn::silu(&z)?;
-        let normed = self.norm.forward(&out)?;
-        let gated = &gate * &normed;
+        let gated = self.norm_gate_metal_or_fallback(&out, &z, metal, batch, tokens, hv, dv)?;
         self.out_proj
             .forward(&gated.reshape(&[batch, tokens, hv * dv])?)
+    }
+
+    fn norm_gate_metal_or_fallback(
+        &self,
+        out: &mlx_rs::Array,
+        z: &mlx_rs::Array,
+        metal: &crate::metal_kernels::LinearGdnKernels,
+        batch: i32,
+        tokens: i32,
+        hv: i32,
+        dv: i32,
+    ) -> Result<mlx_rs::Array> {
+        if self.norm.weight.shape() == [dv] {
+            return metal.norm_gate(
+                out,
+                z,
+                &self.norm.weight,
+                self.norm.eps,
+                batch,
+                tokens,
+                hv,
+                dv,
+            );
+        }
+
+        let gate = mlx_rs::nn::silu(z)?;
+        let normed = self.norm.forward(out)?;
+        Ok(&gate * &normed)
     }
 }
 

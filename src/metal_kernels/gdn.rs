@@ -7,6 +7,7 @@ use super::{MetalKernel, OutputSpec, TemplateArg};
 pub struct LinearGdnKernels {
     conv1d: MetalKernel,
     gated_delta_inline: MetalKernel,
+    norm_gate: MetalKernel,
 }
 
 impl LinearGdnKernels {
@@ -24,6 +25,13 @@ impl LinearGdnKernels {
                 &["conv_out", "a", "b", "A_log", "dt_bias", "state_in", "T"],
                 &["y", "states"],
                 LINEAR_GATED_DELTA_INLINE_SOURCE,
+                "",
+            )?,
+            norm_gate: MetalKernel::new(
+                "mtplx_rs_linear_norm_gate",
+                &["y", "z", "norm_weight", "eps"],
+                &["out"],
+                LINEAR_NORM_GATE_SOURCE,
                 "",
             )?,
         })
@@ -128,6 +136,39 @@ impl LinearGdnKernels {
             .try_into()
             .map_err(|_| anyhow!("linear GDN kernel returned wrong output count"))?;
         Ok((y, states))
+    }
+
+    pub fn norm_gate(
+        &self,
+        y: &Array,
+        z: &Array,
+        norm_weight: &Array,
+        eps: f32,
+        batch: i32,
+        tokens: i32,
+        hv: i32,
+        dv: i32,
+    ) -> Result<Array> {
+        let eps = Array::from_f32(eps);
+        let outputs = self.norm_gate.apply(
+            &[y, z, norm_weight, &eps],
+            &[OutputSpec {
+                shape: &[batch, tokens, hv, dv],
+                dtype: y.dtype(),
+            }],
+            &[
+                TemplateArg::Dtype("InT", y.dtype()),
+                TemplateArg::Dtype("WtT", norm_weight.dtype()),
+                TemplateArg::Int("Dv", dv),
+            ],
+            (32, batch * tokens * hv, 1),
+            (32, 1, 1),
+            &Stream::gpu(),
+        )?;
+        let [out]: [Array; 1] = outputs
+            .try_into()
+            .map_err(|_| anyhow!("linear norm/gate kernel returned wrong output count"))?;
+        Ok(out)
     }
 }
 
@@ -309,5 +350,28 @@ const LINEAR_GATED_DELTA_INLINE_SOURCE: &str = r#"
         state_t[s_idx] = static_cast<StT>(state[i]);
       }
       threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+"#;
+
+const LINEAR_NORM_GATE_SOURCE: &str = r#"
+    auto lane = thread_index_in_simdgroup;
+    auto row = thread_position_in_grid.y;
+    auto base = row * Dv;
+
+    float sum = 0.0f;
+    for (int i = lane; i < Dv; i += 32) {
+      float value = static_cast<float>(y[base + i]);
+      sum += value * value;
+    }
+    sum = simd_sum(sum);
+    float inv = metal::precise::rsqrt(sum / float(Dv) + float(eps));
+
+    for (int i = lane; i < Dv; i += 32) {
+      float z_value = static_cast<float>(z[base + i]);
+      float gate = z_value / (1.0f + metal::exp(-z_value));
+      float normalized = static_cast<float>(y[base + i])
+        * inv
+        * static_cast<float>(norm_weight[i]);
+      out[base + i] = static_cast<InT>(gate * normalized);
     }
 "#;

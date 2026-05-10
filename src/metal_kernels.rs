@@ -360,6 +360,64 @@ mod tests {
     }
 
     #[test]
+    fn linear_norm_gate_matches_reference() -> Result<()> {
+        if std::env::var_os("FERRITE_RUN_METAL_TESTS").is_none() {
+            return Ok(());
+        }
+        let _guard = crate::mlx_test_lock();
+        if std::env::var_os("MAKELEVEL").is_some() {
+            return Ok(());
+        }
+        if !metal_is_available() {
+            return Ok(());
+        }
+
+        let batch = 1;
+        let tokens = 2;
+        let hv = 2;
+        let dv = 4;
+        let y_values = (0..(batch * tokens * hv * dv))
+            .map(|idx| (idx as f32 - 5.0) / 7.0)
+            .collect::<Vec<_>>();
+        let z_values = (0..(batch * tokens * hv * dv))
+            .map(|idx| (idx as f32 - 3.0) / 5.0)
+            .collect::<Vec<_>>();
+        let weight_values = [0.75f32, 1.0, 1.25, 1.5];
+        let y = Array::from_slice(&y_values, &[batch, tokens, hv, dv]);
+        let z = Array::from_slice(&z_values, &[batch, tokens, hv, dv]);
+        let weight = Array::from_slice(&weight_values, &[dv]);
+
+        let kernels = LinearGdnKernels::new()?;
+        let out = kernels.norm_gate(&y, &z, &weight, 1.0e-6, batch, tokens, hv, dv)?;
+        out.eval()?;
+
+        let mut expected = Vec::with_capacity(y_values.len());
+        for row in 0..(batch * tokens * hv) as usize {
+            let base = row * dv as usize;
+            let rms = (y_values[base..base + dv as usize]
+                .iter()
+                .map(|value| value * value)
+                .sum::<f32>()
+                / dv as f32
+                + 1.0e-6)
+                .sqrt();
+            for idx in 0..dv as usize {
+                let z = z_values[base + idx];
+                let gate = z / (1.0 + (-z).exp());
+                expected.push(gate * y_values[base + idx] / rms * weight_values[idx]);
+            }
+        }
+
+        for (got, expected) in out.as_slice::<f32>().iter().zip(expected) {
+            assert!(
+                (got - expected).abs() < 1.0e-5,
+                "got {got}, expected {expected}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn small_m_qmv4_matches_quantized_matmul() -> Result<()> {
         if std::env::var_os("FERRITE_RUN_METAL_TESTS").is_none() {
             return Ok(());
