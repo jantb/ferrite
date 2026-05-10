@@ -1,4 +1,5 @@
 use std::cell::RefCell;
+use std::sync::OnceLock;
 
 use anyhow::Result;
 
@@ -76,15 +77,18 @@ enum DecodeBlockMaskMode {
 }
 
 fn decode_block_mask_mode() -> DecodeBlockMaskMode {
-    match std::env::var("FERRITE_DECODE_BLOCK_MASK")
-        .unwrap_or_default()
-        .trim()
-        .to_ascii_lowercase()
-        .as_str()
-    {
-        "mlx" => DecodeBlockMaskMode::Mlx,
-        _ => DecodeBlockMaskMode::Cpu,
-    }
+    static VALUE: OnceLock<DecodeBlockMaskMode> = OnceLock::new();
+    *VALUE.get_or_init(|| {
+        match std::env::var("FERRITE_DECODE_BLOCK_MASK")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "mlx" => DecodeBlockMaskMode::Mlx,
+            _ => DecodeBlockMaskMode::Cpu,
+        }
+    })
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
