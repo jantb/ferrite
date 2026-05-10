@@ -44,6 +44,25 @@ pub struct DecodeBenchResult {
 }
 
 #[derive(Clone, Debug, Serialize)]
+pub struct InferPathBenchResult {
+    pub model: String,
+    pub prompt_tokens: u32,
+    pub requested_tokens: u32,
+    pub iterations: u32,
+    pub warmup: u32,
+    pub mtp: bool,
+    pub depth: u32,
+    pub load_s: f64,
+    pub avg_prefill_s: f64,
+    pub avg_decode_s: f64,
+    pub avg_total_s: f64,
+    pub prefill_tokens_per_s: f64,
+    pub output_tokens_per_s: f64,
+    pub completion_tokens: u32,
+    pub backend: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
 pub struct MtpBenchResult {
     pub model: String,
     pub prompt_tokens: usize,
@@ -319,6 +338,84 @@ pub fn run_decode_bench(
         steady_state_tokens_per_s: None,
         text,
         backend: "native-mlx-rust-metal-gdn-cached".to_string(),
+    })
+}
+
+#[cfg(feature = "native-mlx")]
+pub fn run_infer_path_bench(
+    model_ref: &str,
+    prompt: &str,
+    tokens: u32,
+    sampling: crate::sampling::SamplingConfig,
+    mtp: bool,
+    depth: u32,
+    iterations: u32,
+    warmup: u32,
+    profile_timings: bool,
+) -> Result<InferPathBenchResult> {
+    use crate::inference::InferenceBackend;
+
+    let backend = crate::inference::NativeMlxBackend::new();
+    let load_s = backend.preload(model_ref)?;
+    let request = crate::inference::InferenceRequest {
+        model: model_ref.to_string(),
+        prompt: prompt.to_string(),
+        system: None,
+        messages: Vec::new(),
+        stop: Vec::new(),
+        max_tokens: Some(tokens),
+        temperature: sampling.temperature,
+        top_p: sampling.top_p,
+        top_k: sampling.top_k,
+        depth,
+        mtp,
+        requested_context_tokens: None,
+        profile_timings,
+    };
+
+    for _ in 0..warmup {
+        let _ = backend.infer(&request)?;
+    }
+
+    let passes = iterations.max(1);
+    let mut prompt_tokens = 0_u32;
+    let mut completion_tokens = 0_u32;
+    let mut prefill_s = 0.0_f64;
+    let mut decode_s = 0.0_f64;
+    let mut total_s = 0.0_f64;
+    let mut backend_name = String::new();
+
+    for _ in 0..passes {
+        let response = backend.infer(&request)?;
+        prompt_tokens = response.prompt_tokens;
+        completion_tokens = response.completion_tokens;
+        backend_name = response.backend;
+        if let Some(timings) = response.timings {
+            prefill_s += timings.prefill_s;
+            decode_s += timings.decode_s;
+            total_s += timings.total_s;
+        }
+    }
+
+    let avg_prefill_s = prefill_s / f64::from(passes);
+    let avg_decode_s = decode_s / f64::from(passes);
+    let avg_total_s = total_s / f64::from(passes);
+    Ok(InferPathBenchResult {
+        model: model_ref.to_string(),
+        prompt_tokens,
+        requested_tokens: tokens,
+        iterations: passes,
+        warmup,
+        mtp,
+        depth,
+        load_s,
+        avg_prefill_s,
+        avg_decode_s,
+        avg_total_s,
+        prefill_tokens_per_s: f64::from(prompt_tokens) / avg_prefill_s.max(f64::EPSILON),
+        output_tokens_per_s: f64::from(completion_tokens) / avg_decode_s.max(f64::EPSILON),
+        completion_tokens,
+        backend: backend_name,
     })
 }
 

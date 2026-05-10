@@ -192,7 +192,7 @@ impl FullAttentionCache {
             .ok()
             .and_then(|value| value.trim().parse::<i32>().ok())
             .filter(|value| *value > 0)
-            .unwrap_or(2048)
+            .unwrap_or(256)
     }
 
     fn current_len(&self) -> i32 {

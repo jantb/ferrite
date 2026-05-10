@@ -31,6 +31,8 @@ pub enum Command {
     BenchNative(BenchNativeArgs),
     /// Benchmark end-to-end generated output tokens.
     BenchDecode(BenchDecodeArgs),
+    /// Benchmark the same inference path used by the server.
+    BenchInfer(BenchInferArgs),
     /// Benchmark greedy MTP draft acceptance against verified target decode.
     BenchMtp(BenchMtpArgs),
     /// Probe usable long-context prefill/decode windows.
@@ -135,6 +137,38 @@ pub struct BenchDecodeArgs {
 }
 
 #[derive(Args, Debug)]
+pub struct BenchInferArgs {
+    #[arg(long)]
+    pub model: Option<String>,
+    #[arg(long, default_value = "hi")]
+    pub prompt: String,
+    #[arg(long)]
+    pub prompt_file: Option<PathBuf>,
+    #[arg(long, default_value_t = 1)]
+    pub prompt_repeat: usize,
+    #[arg(long, default_value_t = 1)]
+    pub tokens: u32,
+    #[arg(long, default_value_t = 0.0)]
+    pub temperature: f32,
+    #[arg(long, default_value_t = 1.0)]
+    pub top_p: f32,
+    #[arg(long, default_value_t = 1)]
+    pub top_k: u32,
+    #[arg(long, default_value_t = 1)]
+    pub iterations: u32,
+    #[arg(long, default_value_t = 0)]
+    pub warmup: u32,
+    #[arg(long, default_value_t = 2)]
+    pub depth: u32,
+    #[arg(long)]
+    pub mtp: bool,
+    #[arg(long)]
+    pub profile_timings: bool,
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Args, Debug)]
 pub struct BenchMtpArgs {
     #[arg(long)]
     pub model: Option<String>,
@@ -183,6 +217,7 @@ pub fn run(cli: Cli) -> Result<()> {
         Command::Inspect(args) => inspect(args),
         Command::BenchNative(args) => bench_native(args),
         Command::BenchDecode(args) => bench_decode(args),
+        Command::BenchInfer(args) => bench_infer(args),
         Command::BenchMtp(args) => bench_mtp(args),
         Command::BenchContext(args) => bench_context(args),
         Command::Status(args) => status(args),
@@ -411,6 +446,52 @@ fn bench_decode(args: BenchDecodeArgs) -> Result<()> {
         println!(
             "note: tok/s excludes model load; steady-state excludes prefill and needs --tokens > 1"
         );
+    }
+    Ok(())
+}
+
+fn bench_infer(args: BenchInferArgs) -> Result<()> {
+    let model_ref = args.model.unwrap_or_else(|| DEFAULT_MODEL.to_string());
+    let mut prompt = prompt_from_args(Some(args.prompt), args.prompt_file)?;
+    if args.prompt_repeat > 1 {
+        prompt = std::iter::repeat_n(prompt, args.prompt_repeat)
+            .collect::<Vec<_>>()
+            .join("\n");
+    }
+    let sampling = crate::sampling::SamplingConfig {
+        temperature: args.temperature,
+        top_p: args.top_p,
+        top_k: args.top_k,
+    };
+    let result = crate::bench::run_infer_path_bench(
+        &model_ref,
+        &prompt,
+        args.tokens,
+        sampling,
+        args.mtp,
+        args.depth,
+        args.iterations,
+        args.warmup,
+        args.profile_timings,
+    )?;
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&result)?);
+    } else {
+        println!("model: {}", result.model);
+        println!("backend: {}", result.backend);
+        println!("prompt tokens: {}", result.prompt_tokens);
+        println!("requested tokens: {}", result.requested_tokens);
+        println!(
+            "iterations: {} (+{} warmup)",
+            result.iterations, result.warmup
+        );
+        println!("load: {:.3}s", result.load_s);
+        println!("avg prefill: {:.3}s", result.avg_prefill_s);
+        println!("avg decode: {:.3}s", result.avg_decode_s);
+        println!("avg total: {:.3}s", result.avg_total_s);
+        println!("prefill tok/s: {:.1}", result.prefill_tokens_per_s);
+        println!("output tok/s: {:.3}", result.output_tokens_per_s);
+        println!("completion tokens: {}", result.completion_tokens);
     }
     Ok(())
 }

@@ -2121,7 +2121,7 @@ fn prefill_chunk_tokens() -> usize {
         .ok()
         .and_then(|value| value.trim().parse::<usize>().ok())
         .filter(|value| *value > 0)
-        .unwrap_or(64)
+        .unwrap_or(128)
 }
 
 #[cfg(feature = "native-mlx")]
