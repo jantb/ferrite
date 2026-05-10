@@ -12,8 +12,6 @@ use crate::inference::{InferenceBackend, NativeMlxBackend};
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ServerConfig {
     pub model: String,
-    pub profile: String,
-    pub max: bool,
     pub host: String,
     pub port: u16,
     pub model_id: String,

@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand};
 
 use crate::inference::{InferenceBackend, InferenceRequest};
 use crate::onboarding;
@@ -39,37 +39,11 @@ pub enum Command {
     Status(StatusArgs),
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum Profile {
-    Sustained,
-    Stable,
-    Safe,
-    PerformanceCold,
-}
-
-impl Profile {
-    pub fn as_ref_arg(self) -> &'static str {
-        match self {
-            Self::Sustained => "sustained",
-            Self::Stable => "stable",
-            Self::Safe => "safe",
-            Self::PerformanceCold => "performance-cold",
-        }
-    }
-}
-
 #[derive(Args, Debug)]
 pub struct ServeArgs {
     /// Model path or Hugging Face repo id.
     #[arg(long)]
     pub model: Option<String>,
-    /// Runtime profile.
-    #[arg(long, value_enum, default_value_t = Profile::Sustained)]
-    pub profile: Profile,
-    /// Opt into fan-backed max mode where supported by the reference runtime.
-    #[arg(long)]
-    pub max: bool,
     #[arg(long, default_value = "127.0.0.1")]
     pub host: String,
     #[arg(long, default_value_t = 11434)]
@@ -92,10 +66,6 @@ pub struct InferArgs {
     pub model: Option<String>,
     #[arg(long)]
     pub system: Option<String>,
-    #[arg(long, value_enum, default_value_t = Profile::Sustained)]
-    pub profile: Profile,
-    #[arg(long)]
-    pub max: bool,
     #[arg(long)]
     pub max_tokens: Option<u32>,
     #[arg(long, default_value_t = 0.6)]
@@ -225,8 +195,6 @@ fn serve(args: ServeArgs) -> Result<()> {
     } else if let Some(model) = args.model {
         ServerConfig {
             model,
-            profile: args.profile.as_ref_arg().to_string(),
-            max: args.max,
             host: args.host,
             port: args.port,
             model_id: args.model_id,
@@ -552,8 +520,6 @@ impl Default for ServeArgs {
     fn default() -> Self {
         Self {
             model: None,
-            profile: Profile::Sustained,
-            max: false,
             host: "127.0.0.1".to_string(),
             port: 11434,
             model_id: DEFAULT_PUBLIC_MODEL_ID.to_string(),
