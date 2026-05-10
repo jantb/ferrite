@@ -196,6 +196,10 @@ pub struct BenchQmv4Args {
     pub n: i32,
     #[arg(long, default_value_t = 128)]
     pub group_size: i32,
+    #[arg(long, default_value_t = 4)]
+    pub simdgroups: i32,
+    #[arg(long, default_value_t = 2)]
+    pub packs_per_thread: i32,
     #[arg(long, default_value_t = 10)]
     pub iterations: u32,
     #[arg(long, default_value_t = 3)]
@@ -559,6 +563,8 @@ fn bench_qmv4(args: BenchQmv4Args) -> Result<()> {
         args.k,
         args.n,
         args.group_size,
+        args.simdgroups,
+        args.packs_per_thread,
         args.iterations,
         args.warmup,
     )?;
@@ -566,8 +572,14 @@ fn bench_qmv4(args: BenchQmv4Args) -> Result<()> {
         println!("{}", serde_json::to_string_pretty(&result)?);
     } else {
         println!(
-            "qmv4 bench: K={} N={} group_size={} iterations={} warmup={}",
-            result.k, result.n, result.group_size, result.iterations, result.warmup
+            "qmv4 bench: K={} N={} group_size={} simdgroups={} packs_per_thread={} iterations={} warmup={}",
+            result.k,
+            result.n,
+            result.group_size,
+            result.simdgroups,
+            result.packs_per_thread,
+            result.iterations,
+            result.warmup
         );
         for case in result.cases {
             println!(

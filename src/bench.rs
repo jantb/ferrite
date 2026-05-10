@@ -88,6 +88,8 @@ pub struct Qmv4BenchResult {
     pub k: i32,
     pub n: i32,
     pub group_size: i32,
+    pub simdgroups: i32,
+    pub packs_per_thread: i32,
     pub iterations: u32,
     pub warmup: u32,
     pub cases: Vec<Qmv4BenchCase>,
@@ -131,6 +133,8 @@ pub fn run_qmv4_bench(
     k: i32,
     n: i32,
     group_size: i32,
+    simdgroups: i32,
+    packs_per_thread: i32,
     iterations: u32,
     warmup: u32,
 ) -> Result<Qmv4BenchResult> {
@@ -148,6 +152,18 @@ pub fn run_qmv4_bench(
         "K must be divisible by the quantization group size"
     );
     anyhow::ensure!(iterations > 0, "iterations must be positive");
+    anyhow::ensure!(
+        matches!(simdgroups, 1 | 2 | 4 | 8),
+        "simdgroups must be 1, 2, 4, or 8"
+    );
+    anyhow::ensure!(
+        packs_per_thread == 2,
+        "packs per thread must be 2 for the current qmv4 Metal helper"
+    );
+    anyhow::ensure!(
+        k % (8 * packs_per_thread * 32) == 0,
+        "K must be divisible by 8 * packs_per_thread * 32"
+    );
     anyhow::ensure!(
         crate::metal_kernels::metal_is_available(),
         "Metal is not available"
@@ -190,8 +206,13 @@ pub fn run_qmv4_bench(
                 4,
             )?;
             stock.eval()?;
-            let ferrite = crate::metal_kernels::small_m_qmv4_matmul_for_bench(&x, &linear)?
-                .ok_or_else(|| anyhow::anyhow!("qmv4 fast path was not eligible"))?;
+            let ferrite = crate::metal_kernels::small_m_qmv4_matmul_for_bench(
+                &x,
+                &linear,
+                simdgroups,
+                packs_per_thread,
+            )?
+            .ok_or_else(|| anyhow::anyhow!("qmv4 fast path was not eligible"))?;
             ferrite.eval()?;
         }
 
@@ -215,8 +236,13 @@ pub fn run_qmv4_bench(
         let ferrite_started = Instant::now();
         let mut ferrite_last = None;
         for _ in 0..iterations {
-            let y = crate::metal_kernels::small_m_qmv4_matmul_for_bench(&x, &linear)?
-                .ok_or_else(|| anyhow::anyhow!("qmv4 fast path was not eligible"))?;
+            let y = crate::metal_kernels::small_m_qmv4_matmul_for_bench(
+                &x,
+                &linear,
+                simdgroups,
+                packs_per_thread,
+            )?
+            .ok_or_else(|| anyhow::anyhow!("qmv4 fast path was not eligible"))?;
             y.eval()?;
             ferrite_last = Some(y);
         }
@@ -252,6 +278,8 @@ pub fn run_qmv4_bench(
         k,
         n,
         group_size,
+        simdgroups,
+        packs_per_thread,
         iterations,
         warmup,
         cases,

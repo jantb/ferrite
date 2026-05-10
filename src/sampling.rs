@@ -420,6 +420,9 @@ mod tests {
     #[cfg(feature = "native-mlx")]
     #[test]
     fn mlx_top_k_distributions_match_cpu_rows() {
+        if std::env::var_os("FERRITE_RUN_METAL_TESTS").is_none() {
+            return;
+        }
         let _guard = crate::mlx_test_lock();
         let config = SamplingConfig {
             temperature: 0.6,

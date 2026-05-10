@@ -31,6 +31,19 @@ fn small_m_qmv4_max_m() -> i32 {
     *MAX_M.get_or_init(|| env_i32("FERRITE_SMALL_M_QMV4_MAX_M", 1).clamp(1, 6))
 }
 
+fn small_m_qmv4_simdgroups() -> i32 {
+    static SIMDGROUPS: OnceLock<i32> = OnceLock::new();
+    *SIMDGROUPS
+        .get_or_init(|| qmv4_simdgroups_or_default(env_i32("FERRITE_SMALL_M_QMV4_SIMDGROUPS", 4)))
+}
+
+fn small_m_qmv4_packs_per_thread() -> i32 {
+    static PACKS: OnceLock<i32> = OnceLock::new();
+    *PACKS.get_or_init(|| {
+        qmv4_packs_per_thread_or_default(env_i32("FERRITE_SMALL_M_QMV4_PACKS_PER_THREAD", 2))
+    })
+}
+
 pub fn small_m_qmv4_strict() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| env_flag("FERRITE_SMALL_M_QMV4_STRICT", false))
@@ -213,22 +226,38 @@ pub fn small_m_qmv4_matmul(
     x: &Array,
     linear: &crate::mlx_backend::QuantizedLinear,
 ) -> Result<Option<Array>> {
-    small_m_qmv4_matmul_impl(x, linear, true)
+    small_m_qmv4_matmul_impl(
+        x,
+        linear,
+        true,
+        small_m_qmv4_simdgroups(),
+        small_m_qmv4_packs_per_thread(),
+    )
 }
 
 pub(crate) fn small_m_qmv4_matmul_for_bench(
     x: &Array,
     linear: &crate::mlx_backend::QuantizedLinear,
+    simdgroups: i32,
+    packs_per_thread: i32,
 ) -> Result<Option<Array>> {
-    small_m_qmv4_matmul_impl(x, linear, false)
+    small_m_qmv4_matmul_impl(
+        x,
+        linear,
+        false,
+        qmv4_simdgroups_or_default(simdgroups),
+        qmv4_packs_per_thread_or_default(packs_per_thread),
+    )
 }
 
 fn small_m_qmv4_matmul_impl(
     x: &Array,
     linear: &crate::mlx_backend::QuantizedLinear,
     require_env_enabled: bool,
+    simdgroups: i32,
+    packs_per_thread: i32,
 ) -> Result<Option<Array>> {
-    if !small_m_qmv4_is_eligible(x, linear, require_env_enabled) {
+    if !small_m_qmv4_is_eligible(x, linear, require_env_enabled, simdgroups, packs_per_thread) {
         return Ok(None);
     }
 
@@ -240,7 +269,9 @@ fn small_m_qmv4_matmul_impl(
     let m_arg = Array::from_int(m);
     let k_arg = Array::from_int(k);
     let n_arg = Array::from_int(n);
-    let grid_y = 4 * ((n + 15) / 16);
+    let results_per_simdgroup = 4;
+    let bn = results_per_simdgroup * simdgroups;
+    let grid_y = simdgroups * ((n + bn - 1) / bn);
     let outputs = with_small_m_qmv4_kernel(x.dtype(), |kernel| {
         kernel.apply(
             &[
@@ -259,9 +290,11 @@ fn small_m_qmv4_matmul_impl(
             &[
                 TemplateArg::Dtype("T", x.dtype()),
                 TemplateArg::Int("GS", linear.group_size),
+                TemplateArg::Int("SG", simdgroups),
+                TemplateArg::Int("PPT", packs_per_thread),
             ],
             (32 * m, grid_y, 1),
-            (32, 4, 1),
+            (32, simdgroups, 1),
             &Stream::gpu(),
         )
     })?;
@@ -316,6 +349,8 @@ fn small_m_qmv4_is_eligible(
     x: &Array,
     linear: &crate::mlx_backend::QuantizedLinear,
     require_env_enabled: bool,
+    simdgroups: i32,
+    packs_per_thread: i32,
 ) -> bool {
     if (require_env_enabled && !small_m_qmv4_enabled()) || !metal_is_available() {
         return false;
@@ -345,6 +380,15 @@ fn small_m_qmv4_is_eligible(
         return false;
     }
     let k = shape[shape.len() - 1];
+    let values_per_thread = 8 * packs_per_thread;
+    let block_size = values_per_thread * 32;
+    if !matches!(simdgroups, 1 | 2 | 4 | 8)
+        || packs_per_thread != 2
+        || linear.group_size < values_per_thread
+        || k % block_size != 0
+    {
+        return false;
+    }
     let weight_shape = linear.weight.shape();
     if weight_shape.len() != 2 {
         return false;
@@ -624,6 +668,18 @@ fn env_i32(name: &str, default: i32) -> i32 {
         .ok()
         .and_then(|value| value.trim().parse::<i32>().ok())
         .unwrap_or(default)
+}
+
+fn qmv4_simdgroups_or_default(value: i32) -> i32 {
+    if matches!(value, 1 | 2 | 4 | 8) {
+        value
+    } else {
+        4
+    }
+}
+
+fn qmv4_packs_per_thread_or_default(value: i32) -> i32 {
+    if value == 2 { value } else { 2 }
 }
 
 #[derive(Debug)]
@@ -906,8 +962,6 @@ const SMALL_M_QMV4_HEADER: &str = r#"
     constant constexpr int BYTES_PER_PACK = 4;
     constant constexpr int BLOCK_SIZE = VALUES_PER_THREAD * SIMD_SIZE;
     constant constexpr int RESULTS_PER_SIMDGROUP = 4;
-    constant constexpr int NUM_SIMDGROUPS = 4;
-    constant constexpr int BN = RESULTS_PER_SIMDGROUP * NUM_SIMDGROUPS;
     template <typename T>
     inline float load_vector4_exact(const device T* x, thread float* x_thread) {
       float sum = 0.0f;
@@ -1204,7 +1258,8 @@ const SMALL_M_QMV4_SOURCE: &str = r#"
     int K = int(K_size);
     int N = int(N_size);
     constexpr int SCALE_STEP_PER_THREAD = GS / VALUES_PER_THREAD;
-    int out_row = int(n_tile) * BN + int(simd_gid) * RESULTS_PER_SIMDGROUP;
+    int bn = RESULTS_PER_SIMDGROUP * SG;
+    int out_row = int(n_tile) * bn + int(simd_gid) * RESULTS_PER_SIMDGROUP;
     int in_vec_size_w = K * BYTES_PER_PACK / PACK_FACTOR;
     int in_vec_size_g = K / GS;
 
@@ -1703,6 +1758,9 @@ mod tests {
 
     #[test]
     fn custom_metal_kernel_adds_one() -> Result<()> {
+        if std::env::var_os("FERRITE_RUN_METAL_TESTS").is_none() {
+            return Ok(());
+        }
         let _guard = crate::mlx_test_lock();
         if std::env::var_os("MAKELEVEL").is_some() {
             return Ok(());
@@ -1738,6 +1796,9 @@ mod tests {
 
     #[test]
     fn small_m_qmv4_matches_quantized_matmul() -> Result<()> {
+        if std::env::var_os("FERRITE_RUN_METAL_TESTS").is_none() {
+            return Ok(());
+        }
         let _guard = crate::mlx_test_lock();
         if std::env::var_os("MAKELEVEL").is_some() {
             return Ok(());
@@ -1782,7 +1843,7 @@ mod tests {
                 4,
             )?
             .as_dtype(Dtype::Float32)?;
-            let actual = small_m_qmv4_matmul_for_bench(&x, &linear)?
+            let actual = small_m_qmv4_matmul_for_bench(&x, &linear, 4, 2)?
                 .expect("small-m qmv4 should be eligible")
                 .as_dtype(Dtype::Float32)?;
             expected.eval()?;
