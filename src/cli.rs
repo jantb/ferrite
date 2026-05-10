@@ -72,7 +72,7 @@ pub struct ServeArgs {
     pub max: bool,
     #[arg(long, default_value = "127.0.0.1")]
     pub host: String,
-    #[arg(long, default_value_t = 8000)]
+    #[arg(long, default_value_t = 11434)]
     pub port: u16,
     #[arg(long, default_value = DEFAULT_PUBLIC_MODEL_ID)]
     pub model_id: String,
@@ -555,7 +555,7 @@ impl Default for ServeArgs {
             profile: Profile::Sustained,
             max: false,
             host: "127.0.0.1".to_string(),
-            port: 8000,
+            port: 11434,
             model_id: DEFAULT_PUBLIC_MODEL_ID.to_string(),
             interactive: false,
             dry_run: false,
