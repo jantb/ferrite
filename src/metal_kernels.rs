@@ -23,7 +23,12 @@ pub fn small_m_qmm4_enabled() -> bool {
 
 pub fn small_m_qmv4_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| env_flag("FERRITE_SMALL_M_QMV4", false))
+    *ENABLED.get_or_init(|| env_flag("FERRITE_SMALL_M_QMV4", true))
+}
+
+fn small_m_qmv4_max_m() -> i32 {
+    static MAX_M: OnceLock<i32> = OnceLock::new();
+    *MAX_M.get_or_init(|| env_i32("FERRITE_SMALL_M_QMV4_MAX_M", 1).clamp(1, 6))
 }
 
 pub fn small_m_qmv4_strict() -> bool {
@@ -255,7 +260,7 @@ fn small_m_qmv4_matmul_impl(
                 TemplateArg::Dtype("T", x.dtype()),
                 TemplateArg::Int("GS", linear.group_size),
             ],
-            (32, grid_y, 1),
+            (32 * m, grid_y, 1),
             (32, 4, 1),
             &Stream::gpu(),
         )
@@ -330,6 +335,9 @@ fn small_m_qmv4_is_eligible(
     }
     let m = shape[shape.len() - 2];
     if !(1..=6).contains(&m) {
+        return false;
+    }
+    if require_env_enabled && m > small_m_qmv4_max_m() {
         return false;
     }
     let leading_batch = shape[..shape.len() - 2].iter().copied().product::<i32>();
@@ -608,6 +616,13 @@ fn env_flag(name: &str, default: bool) -> bool {
             matches!(value.as_str(), "1" | "true" | "yes" | "on")
                 || (!matches!(value.as_str(), "0" | "false" | "no" | "off") && default)
         })
+        .unwrap_or(default)
+}
+
+fn env_i32(name: &str, default: i32) -> i32 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.trim().parse::<i32>().ok())
         .unwrap_or(default)
 }
 
@@ -893,8 +908,6 @@ const SMALL_M_QMV4_HEADER: &str = r#"
     constant constexpr int RESULTS_PER_SIMDGROUP = 4;
     constant constexpr int NUM_SIMDGROUPS = 4;
     constant constexpr int BN = RESULTS_PER_SIMDGROUP * NUM_SIMDGROUPS;
-    constant constexpr int MAX_M = 6;
-
     template <typename T>
     inline float load_vector4_exact(const device T* x, thread float* x_thread) {
       float sum = 0.0f;
@@ -1183,11 +1196,11 @@ const SMALL_M_QMM4_SOURCE: &str = r#"
 "#;
 
 const SMALL_M_QMV4_SOURCE: &str = r#"
+    uint m_tile = threadgroup_position_in_grid.x;
     uint n_tile = threadgroup_position_in_grid.y;
     uint simd_gid = simdgroup_index_in_threadgroup;
     uint simd_lid = thread_index_in_simdgroup;
 
-    int M = int(M_size);
     int K = int(K_size);
     int N = int(N_size);
     constexpr int SCALE_STEP_PER_THREAD = GS / VALUES_PER_THREAD;
@@ -1202,27 +1215,16 @@ const SMALL_M_QMV4_SOURCE: &str = r#"
       scales + out_row * in_vec_size_g + int(simd_lid) / SCALE_STEP_PER_THREAD;
     const device T* biases_base =
       biases + out_row * in_vec_size_g + int(simd_lid) / SCALE_STEP_PER_THREAD;
+    const device T* x_base =
+      x + int(m_tile) * K + int(simd_lid) * VALUES_PER_THREAD;
 
-    float result[MAX_M][RESULTS_PER_SIMDGROUP];
-    float x_thread[MAX_M][VALUES_PER_THREAD];
-    float x_sum[MAX_M];
-
-    for (int m = 0; m < MAX_M; ++m) {
-      x_sum[m] = 0.0f;
-      for (int row = 0; row < RESULTS_PER_SIMDGROUP; ++row) {
-        result[m][row] = 0.0f;
-      }
-    }
+    float result[RESULTS_PER_SIMDGROUP] = {0.0f};
+    float x_thread[VALUES_PER_THREAD];
 
     #pragma clang loop unroll_count(4)
     for (int k_block = 0; k_block < K; k_block += BLOCK_SIZE) {
-      for (int m = 0; m < MAX_M; ++m) {
-        if (m < M) {
-          const device T* x_m =
-            x + m * K + k_block + int(simd_lid) * VALUES_PER_THREAD;
-          x_sum[m] = load_vector4_exact<T>(x_m, x_thread[m]);
-        }
-      }
+      const device T* x_block = x_base + k_block;
+      float x_sum = load_vector4_exact<T>(x_block, x_thread);
 
       const device uint8_t* ws_block =
         ws_base + k_block * BYTES_PER_PACK / PACK_FACTOR;
@@ -1238,11 +1240,7 @@ const SMALL_M_QMV4_SOURCE: &str = r#"
           float s = float(sl[0]);
           float b = float(bl[0]);
 
-          for (int m = 0; m < MAX_M; ++m) {
-            if (m < M) {
-              result[m][row] += qdot4_exact(wl, x_thread[m], s, b, x_sum[m]);
-            }
-          }
+          result[row] += qdot4_exact(wl, x_thread, s, b, x_sum);
         }
       }
     }
@@ -1250,13 +1248,9 @@ const SMALL_M_QMV4_SOURCE: &str = r#"
     for (int row = 0; row < RESULTS_PER_SIMDGROUP; ++row) {
       int n = out_row + row;
       if (n < N) {
-        for (int m = 0; m < MAX_M; ++m) {
-          if (m < M) {
-            float sum = simd_sum(result[m][row]);
-            if (simd_lid == 0) {
-              y[m * N + n] = T(sum);
-            }
-          }
+        float sum = simd_sum(result[row]);
+        if (simd_lid == 0) {
+          y[int(m_tile) * N + n] = T(sum);
         }
       }
     }

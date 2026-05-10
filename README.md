@@ -198,7 +198,8 @@ FERRITE_PREFILL_EVAL_INTERVAL_CHUNKS=1
 FERRITE_FULL_KV_CACHE_STEP=256
 FERRITE_FULL_KV_CACHE_APPEND=tail_owned
 FERRITE_DECODE_BLOCK_MASK=cpu
-FERRITE_SMALL_M_QMV4=0
+FERRITE_SMALL_M_QMV4=1
+FERRITE_SMALL_M_QMV4_MAX_M=1
 FERRITE_SMALL_M_QMV4_STRICT=0
 FERRITE_SPLIT_FULL_ATTN=1
 FERRITE_SPLIT_FULL_ATTN_THRESHOLD=1024
@@ -222,7 +223,7 @@ Create `ferrite-kill-switch` in the working directory to make Ferrite reject the
 `FERRITE_RSS_KILL_BYTES` defaults to 50% of physical memory when unset; set it lower for a stricter process kill, or `0` to disable the RSS limit.
 `FERRITE_MLX_ACTIVE_KILL_BYTES` defaults to 80% of physical memory when unset; set it lower to stop MLX active-memory spikes earlier, or `0` to disable the active-memory limit.
 Prompt prefill is evaluated in chunks by default so tool-heavy requests do not build one large MLX graph before generation starts. Full-attention K/V cache storage grows in `FERRITE_FULL_KV_CACHE_STEP` token blocks to avoid concatenating and copying the entire dense cache on every prefill chunk. `FERRITE_SPLIT_FULL_ATTN_*`, `FERRITE_BLOCKWISE_FULL_ATTN`, `FERRITE_DECODE_BLOCK_MASK=mlx`, `FERRITE_PREFILL_EVAL_INTERVAL_CHUNKS`, `FERRITE_PREFILL_EVAL_LAYER_INTERVAL`, and `FERRITE_FULL_KV_CACHE_APPEND=concat` are diagnostic tuning knobs; the defaults are the measured safe path.
-`FERRITE_SMALL_M_QMV4=1` opts into Ferrite's experimental BN16/4-simdgroup qmv4 path for small-M quantized linears. `FERRITE_SMALL_M_QMV4_STRICT=1` turns fallback shader failures into request errors.
+`FERRITE_SMALL_M_QMV4=1` enables Ferrite's Rust-owned BN16/4-simdgroup qmv4 path for small-M quantized linears. It defaults to `FERRITE_SMALL_M_QMV4_MAX_M=1` because the custom path is faster for single-token decode on the measured M4 MBP, while larger small-M verify shapes currently stay on patched MLX. `FERRITE_SMALL_M_QMV4_STRICT=1` turns fallback shader failures into request errors.
 
 ## Notes
 
