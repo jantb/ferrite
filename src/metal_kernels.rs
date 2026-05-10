@@ -21,6 +21,16 @@ pub fn small_m_qmm4_enabled() -> bool {
     *ENABLED.get_or_init(|| env_flag("MTPLX_SMALL_M_QMM4", false))
 }
 
+pub fn small_m_qmv4_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env_flag("FERRITE_SMALL_M_QMV4", true))
+}
+
+pub fn small_m_qmv4_strict() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env_flag("FERRITE_SMALL_M_QMV4_STRICT", false))
+}
+
 pub fn gate_up_swiglu_qmv4_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| env_flag("MTPLX_GATE_UP_SWIGLU_QMV4", false))
@@ -194,6 +204,60 @@ pub fn small_m_qmm4_matmul(
     Ok(Some(y.reshape(&out_shape)?))
 }
 
+pub fn small_m_qmv4_matmul(
+    x: &Array,
+    linear: &crate::mlx_backend::QuantizedLinear,
+) -> Result<Option<Array>> {
+    if !small_m_qmv4_is_eligible(x, linear) {
+        return Ok(None);
+    }
+
+    let shape = x.shape().to_vec();
+    let m = shape[shape.len() - 2];
+    let k = shape[shape.len() - 1];
+    let n = linear.weight.shape()[0];
+    let x2 = x.reshape(&[m, k])?;
+    let m_arg = Array::from_int(m);
+    let k_arg = Array::from_int(k);
+    let n_arg = Array::from_int(n);
+    let grid_y = 4 * ((n + 15) / 16);
+    let outputs = with_small_m_qmv4_kernel(x.dtype(), |kernel| {
+        kernel.apply(
+            &[
+                &x2,
+                &linear.weight,
+                &linear.scales,
+                &linear.biases,
+                &m_arg,
+                &k_arg,
+                &n_arg,
+            ],
+            &[OutputSpec {
+                shape: &[m, n],
+                dtype: x.dtype(),
+            }],
+            &[
+                TemplateArg::Dtype("T", x.dtype()),
+                TemplateArg::Int("GS", linear.group_size),
+            ],
+            (32, grid_y, 1),
+            (32, 4, 1),
+            &Stream::gpu(),
+        )
+    })?;
+    let [mut y]: [Array; 1] = outputs
+        .try_into()
+        .map_err(|_| anyhow!("small-m qmv4 kernel returned wrong output count"))?;
+    if let Some(bias) = &linear.bias {
+        y = y.add(bias)?;
+    }
+    let mut out_shape = shape;
+    if let Some(last) = out_shape.last_mut() {
+        *last = n;
+    }
+    Ok(Some(y.reshape(&out_shape)?))
+}
+
 fn small_m_qmm4_is_eligible(x: &Array, linear: &crate::mlx_backend::QuantizedLinear) -> bool {
     if !small_m_qmm4_enabled() || !metal_is_available() {
         return false;
@@ -226,6 +290,40 @@ fn small_m_qmm4_is_eligible(x: &Array, linear: &crate::mlx_backend::QuantizedLin
     }
     let n = weight_shape[0];
     k == weight_shape[1] * 8 && k % 32 == 0 && n % 32 == 0
+}
+
+fn small_m_qmv4_is_eligible(x: &Array, linear: &crate::mlx_backend::QuantizedLinear) -> bool {
+    if !small_m_qmv4_enabled() || !metal_is_available() {
+        return false;
+    }
+    if linear.bits != 4 || !matches!(linear.group_size, 32 | 64 | 128) {
+        return false;
+    }
+    if !matches!(x.dtype(), Dtype::Bfloat16 | Dtype::Float16) {
+        return false;
+    }
+    if linear.scales.dtype() != x.dtype() || linear.biases.dtype() != x.dtype() {
+        return false;
+    }
+    let shape = x.shape();
+    if shape.len() < 2 {
+        return false;
+    }
+    let m = shape[shape.len() - 2];
+    if !(1..=6).contains(&m) {
+        return false;
+    }
+    let leading_batch = shape[..shape.len() - 2].iter().copied().product::<i32>();
+    if leading_batch != 1 {
+        return false;
+    }
+    let k = shape[shape.len() - 1];
+    let weight_shape = linear.weight.shape();
+    if weight_shape.len() != 2 {
+        return false;
+    }
+    let n = weight_shape[0];
+    k == weight_shape[1] * 8 && k % 512 == 0 && n > 0
 }
 
 pub fn multi3_qmv4_matmul(
@@ -318,6 +416,8 @@ thread_local! {
     static GATE_UP_SWIGLU_QMV4_F16: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
     static SMALL_M_QMM4_BF16: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
     static SMALL_M_QMM4_F16: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
+    static SMALL_M_QMV4_BF16: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
+    static SMALL_M_QMV4_F16: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
     static MULTI3_QMV4_BF16: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
     static MULTI3_QMV4_F16: RefCell<Option<MetalKernel>> = const { RefCell::new(None) };
 }
@@ -407,6 +507,44 @@ fn with_cached_small_m_kernel<T>(
     }
     let kernel = slot.borrow();
     f(kernel.as_ref().expect("small-m qmm4 kernel initialized"))
+}
+
+fn with_small_m_qmv4_kernel<T>(
+    dtype: Dtype,
+    f: impl FnOnce(&MetalKernel) -> Result<T>,
+) -> Result<T> {
+    match dtype {
+        Dtype::Bfloat16 => {
+            SMALL_M_QMV4_BF16.with(|slot| with_cached_small_m_qmv4_kernel(slot, dtype, f))
+        }
+        Dtype::Float16 => {
+            SMALL_M_QMV4_F16.with(|slot| with_cached_small_m_qmv4_kernel(slot, dtype, f))
+        }
+        other => bail!("small-m qmv4 does not support dtype {other:?}"),
+    }
+}
+
+fn with_cached_small_m_qmv4_kernel<T>(
+    slot: &RefCell<Option<MetalKernel>>,
+    dtype: Dtype,
+    f: impl FnOnce(&MetalKernel) -> Result<T>,
+) -> Result<T> {
+    if slot.borrow().is_none() {
+        let name = match dtype {
+            Dtype::Bfloat16 => "ferrite_small_m_qmv4_bn16_bf16",
+            Dtype::Float16 => "ferrite_small_m_qmv4_bn16_f16",
+            other => bail!("small-m qmv4 does not support dtype {other:?}"),
+        };
+        *slot.borrow_mut() = Some(MetalKernel::new(
+            name,
+            &["x", "w", "scales", "biases", "M_size", "K_size", "N_size"],
+            &["y"],
+            SMALL_M_QMV4_SOURCE,
+            SMALL_M_QMV4_HEADER,
+        )?);
+    }
+    let kernel = slot.borrow();
+    f(kernel.as_ref().expect("small-m qmv4 kernel initialized"))
 }
 
 fn with_multi3_qmv4_kernel<T>(
@@ -724,6 +862,53 @@ const MULTI3_QMV4_HEADER: &str = r#"
     }
 "#;
 
+const SMALL_M_QMV4_HEADER: &str = r#"
+    using namespace metal;
+
+    constant constexpr int SIMD_SIZE = 32;
+    constant constexpr int PACK_FACTOR = 8;
+    constant constexpr int PACKS_PER_THREAD = 2;
+    constant constexpr int VALUES_PER_THREAD = PACK_FACTOR * PACKS_PER_THREAD;
+    constant constexpr int BYTES_PER_PACK = 4;
+    constant constexpr int BLOCK_SIZE = VALUES_PER_THREAD * SIMD_SIZE;
+    constant constexpr int RESULTS_PER_SIMDGROUP = 4;
+    constant constexpr int NUM_SIMDGROUPS = 4;
+    constant constexpr int BN = RESULTS_PER_SIMDGROUP * NUM_SIMDGROUPS;
+    constant constexpr int MAX_M = 6;
+
+    template <typename T>
+    inline float load_vector4_exact(const device T* x, thread float* x_thread) {
+      float sum = 0.0f;
+      for (int i = 0; i < VALUES_PER_THREAD; i += 4) {
+        sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3];
+        x_thread[i] = x[i];
+        x_thread[i + 1] = x[i + 1] / 16.0f;
+        x_thread[i + 2] = x[i + 2] / 256.0f;
+        x_thread[i + 3] = x[i + 3] / 4096.0f;
+      }
+      return sum;
+    }
+
+    inline float qdot4_exact(
+        const device uint8_t* w,
+        const thread float* x_thread,
+        float scale,
+        float bias,
+        float sum) {
+      const device uint16_t* ws = (const device uint16_t*)w;
+      float accum = 0.0f;
+      for (int i = 0; i < (VALUES_PER_THREAD / 4); ++i) {
+        uint16_t packed = ws[i];
+        accum +=
+          x_thread[4 * i] * float(packed & 0x000f) +
+          x_thread[4 * i + 1] * float(packed & 0x00f0) +
+          x_thread[4 * i + 2] * float(packed & 0x0f00) +
+          x_thread[4 * i + 3] * float(packed & 0xf000);
+      }
+      return scale * accum + sum * bias;
+    }
+"#;
+
 const GATE_UP_SWIGLU_QMV4_HEADER: &str = r#"
     using namespace metal;
 
@@ -976,6 +1161,86 @@ const SMALL_M_QMM4_SOURCE: &str = r#"
     c_R_T.thread_elements()[1] = T(c_R.thread_elements()[1]);
     simdgroup_store(c_L_T, y + n0 + sg_n_off, N);
     simdgroup_store(c_R_T, y + n0 + sg_n_off + 8, N);
+"#;
+
+const SMALL_M_QMV4_SOURCE: &str = r#"
+    uint n_tile = threadgroup_position_in_grid.y;
+    uint simd_gid = simdgroup_index_in_threadgroup;
+    uint simd_lid = thread_index_in_simdgroup;
+
+    int M = int(M_size);
+    int K = int(K_size);
+    int N = int(N_size);
+    constexpr int SCALE_STEP_PER_THREAD = GS / VALUES_PER_THREAD;
+    int out_row = int(n_tile) * BN + int(simd_gid) * RESULTS_PER_SIMDGROUP;
+    int in_vec_size_w = K * BYTES_PER_PACK / PACK_FACTOR;
+    int in_vec_size_g = K / GS;
+
+    const device uint8_t* ws_base =
+      (const device uint8_t*)w + out_row * in_vec_size_w
+      + int(simd_lid) * PACKS_PER_THREAD * BYTES_PER_PACK;
+    const device T* scales_base =
+      scales + out_row * in_vec_size_g + int(simd_lid) / SCALE_STEP_PER_THREAD;
+    const device T* biases_base =
+      biases + out_row * in_vec_size_g + int(simd_lid) / SCALE_STEP_PER_THREAD;
+
+    float result[MAX_M][RESULTS_PER_SIMDGROUP];
+    float x_thread[MAX_M][VALUES_PER_THREAD];
+    float x_sum[MAX_M];
+
+    for (int m = 0; m < MAX_M; ++m) {
+      x_sum[m] = 0.0f;
+      for (int row = 0; row < RESULTS_PER_SIMDGROUP; ++row) {
+        result[m][row] = 0.0f;
+      }
+    }
+
+    #pragma clang loop unroll_count(4)
+    for (int k_block = 0; k_block < K; k_block += BLOCK_SIZE) {
+      for (int m = 0; m < MAX_M; ++m) {
+        if (m < M) {
+          const device T* x_m =
+            x + m * K + k_block + int(simd_lid) * VALUES_PER_THREAD;
+          x_sum[m] = load_vector4_exact<T>(x_m, x_thread[m]);
+        }
+      }
+
+      const device uint8_t* ws_block =
+        ws_base + k_block * BYTES_PER_PACK / PACK_FACTOR;
+      const device T* scales_block = scales_base + k_block / GS;
+      const device T* biases_block = biases_base + k_block / GS;
+
+      for (int row = 0; row < RESULTS_PER_SIMDGROUP; ++row) {
+        int n = out_row + row;
+        if (n < N) {
+          const device uint8_t* wl = ws_block + row * in_vec_size_w;
+          const device T* sl = scales_block + row * in_vec_size_g;
+          const device T* bl = biases_block + row * in_vec_size_g;
+          float s = float(sl[0]);
+          float b = float(bl[0]);
+
+          for (int m = 0; m < MAX_M; ++m) {
+            if (m < M) {
+              result[m][row] += qdot4_exact(wl, x_thread[m], s, b, x_sum[m]);
+            }
+          }
+        }
+      }
+    }
+
+    for (int row = 0; row < RESULTS_PER_SIMDGROUP; ++row) {
+      int n = out_row + row;
+      if (n < N) {
+        for (int m = 0; m < MAX_M; ++m) {
+          if (m < M) {
+            float sum = simd_sum(result[m][row]);
+            if (simd_lid == 0) {
+              y[m * N + n] = T(sum);
+            }
+          }
+        }
+      }
+    }
 "#;
 
 const MULTI3_QMV4_SOURCE: &str = r#"
@@ -1455,6 +1720,73 @@ mod tests {
         assert_eq!(outputs.len(), 1);
         outputs[0].eval()?;
         assert_eq!(outputs[0].as_slice::<f32>(), &[2.0, 3.0, 4.0, 5.0]);
+        Ok(())
+    }
+
+    #[test]
+    fn small_m_qmv4_matches_quantized_matmul() -> Result<()> {
+        let _guard = crate::mlx_test_lock();
+        if std::env::var_os("MAKELEVEL").is_some() {
+            return Ok(());
+        }
+        if !metal_is_available() {
+            return Ok(());
+        }
+
+        let k = 512;
+        let n = 24;
+        let group_size = 128;
+        let dense_w_values = (0..(n * k))
+            .map(|idx| (((idx * 17 + 11) % 41) as f32 - 20.0) / 17.0)
+            .collect::<Vec<_>>();
+        let dense_w = Array::from_slice(&dense_w_values, &[n, k]).as_dtype(Dtype::Bfloat16)?;
+        let (weight, scales, biases) = mlx_rs::ops::quantize(&dense_w, group_size, 4)?;
+        weight.eval()?;
+        scales.eval()?;
+        biases.eval()?;
+
+        let linear = crate::mlx_backend::QuantizedLinear {
+            weight,
+            scales,
+            biases,
+            bias: None,
+            group_size,
+            bits: 4,
+        };
+
+        for m in [1, 3, 6] {
+            let x_values = (0..(m * k))
+                .map(|idx| (((idx * 13 + 7) % 37) as f32 - 18.0) / 19.0)
+                .collect::<Vec<_>>();
+            let x = Array::from_slice(&x_values, &[m, k]).as_dtype(Dtype::Bfloat16)?;
+            let expected = mlx_rs::ops::quantized_matmul(
+                &x,
+                &linear.weight,
+                &linear.scales,
+                &linear.biases,
+                true,
+                group_size,
+                4,
+            )?
+            .as_dtype(Dtype::Float32)?;
+            let actual = small_m_qmv4_matmul(&x, &linear)?
+                .expect("small-m qmv4 should be eligible")
+                .as_dtype(Dtype::Float32)?;
+            expected.eval()?;
+            actual.eval()?;
+
+            let expected = expected.as_slice::<f32>();
+            let actual = actual.as_slice::<f32>();
+            assert_eq!(actual.len(), expected.len());
+            for (idx, (actual, expected)) in actual.iter().zip(expected.iter()).enumerate() {
+                let diff = (actual - expected).abs();
+                assert!(
+                    diff <= 0.125,
+                    "m={m} idx={idx} actual={actual} expected={expected} diff={diff}"
+                );
+            }
+        }
+
         Ok(())
     }
 }

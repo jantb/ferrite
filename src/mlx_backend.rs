@@ -94,6 +94,17 @@ pub struct QuantizedLinear {
 
 impl QuantizedLinear {
     pub fn forward(&self, x: &Array) -> Result<Array> {
+        if crate::metal_kernels::small_m_qmv4_enabled() {
+            match crate::metal_kernels::small_m_qmv4_matmul(x, self) {
+                Ok(Some(y)) => return Ok(y),
+                Ok(None) => {}
+                Err(err) => {
+                    if crate::metal_kernels::small_m_qmv4_strict() {
+                        return Err(err).context("small-m qmv4 fast path failed");
+                    }
+                }
+            }
+        }
         if crate::metal_kernels::small_m_qmm4_enabled() {
             if let Some(y) = crate::metal_kernels::small_m_qmm4_matmul(x, self)? {
                 return Ok(y);
