@@ -8,7 +8,7 @@ use mlx_rs::ops::indexing::IndexOp;
 use serde::{Deserialize, Serialize};
 
 #[cfg(feature = "native-mlx")]
-const DEFAULT_MAX_KV_CONTEXT_TOKENS: usize = 65_536;
+const DEFAULT_MAX_KV_CONTEXT_TOKENS: usize = 16_384;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct InferenceRequest {
@@ -966,17 +966,19 @@ fn prepare_prompt_state(
     let needs_mtp_history =
         persistent_mtp && request.mtp && request.depth > 0 && session.qwen.mtp.is_some();
 
-    if env_flag("MTPLX_PREFIX_CACHE", true) {
-        if let Some(cached) = best_prompt_cache_match(session, prompt_ids) {
-            let mut state = cached.state.clone();
-            let mut logits = cached.logits.clone();
-            let mut hidden = cached.hidden.clone();
+    if env_flag("MTPLX_PREFIX_CACHE", false) {
+        if let Some(index) = best_prompt_cache_match_index(session, prompt_ids) {
+            let cached = session.prompt_caches.remove(index);
+            let cached_prompt_len = cached.prompt_ids.len();
+            let mut state = cached.state;
+            let mut logits = cached.logits;
+            let mut hidden = cached.hidden;
             let mut mtp_history_state = if needs_mtp_history {
-                cached.mtp_history_state.clone()
+                cached.mtp_history_state
             } else {
                 session.qwen.new_mtp_decode_state().unwrap_or_default()
             };
-            let suffix = &prompt_ids[cached.prompt_ids.len()..];
+            let suffix = &prompt_ids[cached_prompt_len..];
             if !suffix.is_empty() {
                 let base_hidden = hidden.clone();
                 let (suffix_logits, suffix_hidden) = session
@@ -1016,7 +1018,7 @@ fn prepare_prompt_state(
                 mtp_history_state,
                 prefill_s,
                 prefix_cache_hit: true,
-                prefix_cache_tokens: cached.prompt_ids.len(),
+                prefix_cache_tokens: cached_prompt_len,
             });
         }
     }
@@ -1066,16 +1068,14 @@ fn is_token_prefix(prefix: &[u32], full: &[u32]) -> bool {
 }
 
 #[cfg(feature = "native-mlx")]
-fn best_prompt_cache_match(
-    session: &NativeMlxSession,
-    prompt_ids: &[u32],
-) -> Option<PromptStateCache> {
+fn best_prompt_cache_match_index(session: &NativeMlxSession, prompt_ids: &[u32]) -> Option<usize> {
     session
         .prompt_caches
         .iter()
-        .filter(|cached| is_token_prefix(&cached.prompt_ids, prompt_ids))
-        .max_by_key(|cached| cached.prompt_ids.len())
-        .cloned()
+        .enumerate()
+        .filter(|(_, cached)| is_token_prefix(&cached.prompt_ids, prompt_ids))
+        .max_by_key(|(_, cached)| cached.prompt_ids.len())
+        .map(|(index, _)| index)
 }
 
 #[cfg(feature = "native-mlx")]
@@ -1087,7 +1087,7 @@ fn maybe_store_prompt_cache(
     hidden: &mlx_rs::Array,
     mtp_history_state: &crate::qwen36::MtpDecodeState,
 ) {
-    if !env_flag("MTPLX_PREFIX_CACHE", true) {
+    if !env_flag("MTPLX_PREFIX_CACHE", false) {
         session.prompt_caches.clear();
         return;
     }
@@ -1323,7 +1323,7 @@ fn maybe_store_post_generation_cache(
 
 #[cfg(feature = "native-mlx")]
 fn post_generation_cache_enabled() -> bool {
-    env_flag("MTPLX_POST_GENERATION_CACHE", false) && env_flag("MTPLX_PREFIX_CACHE", true)
+    env_flag("MTPLX_POST_GENERATION_CACHE", false) && env_flag("MTPLX_PREFIX_CACHE", false)
 }
 
 #[cfg(feature = "native-mlx")]
@@ -1333,7 +1333,7 @@ fn maybe_store_chat_post_generation_cache(
     assistant_text: &str,
 ) -> Result<()> {
     if !env_flag("MTPLX_CHAT_POST_GENERATION_CACHE", false)
-        || !env_flag("MTPLX_PREFIX_CACHE", true)
+        || !env_flag("MTPLX_PREFIX_CACHE", false)
         || assistant_text.is_empty()
     {
         return Ok(());
@@ -1393,7 +1393,7 @@ fn prefix_cache_max_tokens() -> usize {
     ferrite_env_var("MTPLX_PREFIX_CACHE_MAX_TOKENS")
         .ok()
         .and_then(|value| value.trim().parse::<usize>().ok())
-        .unwrap_or(65_536)
+        .unwrap_or(DEFAULT_MAX_KV_CONTEXT_TOKENS)
 }
 
 #[cfg(feature = "native-mlx")]
@@ -1401,7 +1401,7 @@ fn prefix_cache_max_entries() -> usize {
     ferrite_env_var("MTPLX_PREFIX_CACHE_ENTRIES")
         .ok()
         .and_then(|value| value.trim().parse::<usize>().ok())
-        .unwrap_or(2)
+        .unwrap_or(1)
 }
 
 #[cfg(feature = "native-mlx")]
@@ -1409,7 +1409,7 @@ fn prefix_cache_max_bytes() -> usize {
     ferrite_env_var("MTPLX_PREFIX_CACHE_MAX_BYTES")
         .ok()
         .and_then(|value| value.trim().parse::<usize>().ok())
-        .unwrap_or(4 * 1024 * 1024 * 1024)
+        .unwrap_or(1024 * 1024 * 1024)
 }
 
 #[cfg(feature = "native-mlx")]

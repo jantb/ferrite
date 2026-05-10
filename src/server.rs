@@ -256,11 +256,11 @@ fn handle_connection(
             200,
             &json!({
                 "modelfile": "",
-                "parameters": "num_ctx 65536",
+                "parameters": "num_ctx 16384",
                 "model_info": {
                     "general.architecture": "qwen3.6",
-                    "general.context_length": 262144,
-                    "qwen3.6.context_length": 262144
+                    "general.context_length": 16384,
+                    "qwen3.6.context_length": 16384
                 }
             }),
         )?,

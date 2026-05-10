@@ -177,16 +177,16 @@ Use model:
 ferrite-qwen36-27b-optimized-speed
 ```
 
-Ferrite keeps a small warm prefix cache in-process. This helps repeated agent turns when the prompt reuses previous context.
+Ferrite can keep a small warm prefix cache in-process. It is disabled by default to keep long-running agent sessions from retaining KV memory between turns.
 
 Useful cache environment variables:
 
 ```sh
-FERRITE_PREFIX_CACHE=1
-FERRITE_PREFIX_CACHE_ENTRIES=2
-FERRITE_PREFIX_CACHE_MAX_TOKENS=65536
-FERRITE_PREFIX_CACHE_MAX_BYTES=4294967296
-FERRITE_MAX_KV_CONTEXT_TOKENS=65536
+FERRITE_PREFIX_CACHE=0
+FERRITE_PREFIX_CACHE_ENTRIES=1
+FERRITE_PREFIX_CACHE_MAX_TOKENS=16384
+FERRITE_PREFIX_CACHE_MAX_BYTES=1073741824
+FERRITE_MAX_KV_CONTEXT_TOKENS=16384
 FERRITE_POST_GENERATION_CACHE=0
 FERRITE_CHAT_POST_GENERATION_CACHE=0
 ```
