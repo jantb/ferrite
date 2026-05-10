@@ -830,7 +830,7 @@ fn ollama_tools_prompt(tools: &[OllamaTool]) -> Option<String> {
          You are provided with function signatures inside <tools></tools> XML tags:\n<tools>\n",
     );
     for tool in tools {
-        if let Ok(line) = serde_json::to_string(tool) {
+        if let Ok(line) = serde_json::to_string(&tool_prompt_signature(tool)) {
             out.push_str(&line);
             out.push('\n');
         }
@@ -841,6 +841,53 @@ fn ollama_tools_prompt(tools: &[OllamaTool]) -> Option<String> {
          {\"name\":\"function_name\",\"arguments\":{\"arg\":\"value\"}}\n</tool_call>",
     );
     Some(out)
+}
+
+fn tool_prompt_signature(tool: &OllamaTool) -> serde_json::Value {
+    let mut signature = serde_json::Map::new();
+    signature.insert("name".to_string(), json!(tool.function.name));
+    if let Some(description) = tool.function.description.as_deref() {
+        signature.insert(
+            "description".to_string(),
+            json!(compact_tool_description(description)),
+        );
+    }
+    signature.insert(
+        "parameters".to_string(),
+        compact_tool_schema(&tool.function.parameters),
+    );
+    serde_json::Value::Object(signature)
+}
+
+fn compact_tool_description(description: &str) -> String {
+    const MAX_DESCRIPTION_CHARS: usize = 180;
+    let trimmed = description.trim();
+    if trimmed.chars().count() <= MAX_DESCRIPTION_CHARS {
+        return trimmed.to_string();
+    }
+    trimmed.chars().take(MAX_DESCRIPTION_CHARS).collect()
+}
+
+fn compact_tool_schema(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Array(values) => {
+            serde_json::Value::Array(values.iter().map(compact_tool_schema).collect())
+        }
+        serde_json::Value::Object(map) => {
+            let mut compact = serde_json::Map::new();
+            for (key, value) in map {
+                if matches!(
+                    key.as_str(),
+                    "description" | "title" | "default" | "examples" | "$schema"
+                ) {
+                    continue;
+                }
+                compact.insert(key.clone(), compact_tool_schema(value));
+            }
+            serde_json::Value::Object(compact)
+        }
+        _ => value.clone(),
+    }
 }
 
 enum OllamaStreamEvent {
@@ -1075,6 +1122,44 @@ mod tests {
         assert!(prompt.contains("<tools>"));
         assert!(prompt.contains("\"name\":\"read_file\""));
         assert!(prompt.contains("<tool_call>"));
+    }
+
+    #[test]
+    fn ollama_tool_prompt_removes_verbose_schema_metadata() {
+        let prompt = ollama_tools_prompt(&[OllamaTool {
+            kind: "function".to_string(),
+            function: OllamaToolDefinition {
+                name: "write_file".to_string(),
+                description: Some("Write a file".repeat(40)),
+                parameters: json!({
+                    "type": "object",
+                    "title": "WriteFileArgs",
+                    "description": "Verbose schema text",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "Path to write",
+                            "default": "main.kt"
+                        },
+                        "content": {
+                            "type": "string",
+                            "description": "File contents"
+                        }
+                    },
+                    "required": ["path", "content"]
+                }),
+            },
+        }])
+        .unwrap();
+
+        assert!(prompt.contains("\"name\":\"write_file\""));
+        assert!(prompt.contains("\"path\""));
+        assert!(prompt.contains("\"content\""));
+        assert!(prompt.contains("\"required\""));
+        assert!(!prompt.contains("WriteFileArgs"));
+        assert!(!prompt.contains("Verbose schema text"));
+        assert!(!prompt.contains("Path to write"));
+        assert!(!prompt.contains("main.kt"));
     }
 
     #[test]
