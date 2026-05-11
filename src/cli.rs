@@ -35,6 +35,8 @@ pub enum Command {
     BenchInfer(BenchInferArgs),
     /// Profile a native prefill block by layer category.
     BenchPrefillProfile(BenchPrefillProfileArgs),
+    /// Benchmark cache-only chunked prefill across chunk sizes.
+    BenchFastPrefill(BenchFastPrefillArgs),
     /// Benchmark greedy MTP draft acceptance against verified target decode.
     BenchMtp(BenchMtpArgs),
     /// Benchmark the small-M qmv4 QuantizedLinear fast path.
@@ -193,6 +195,27 @@ pub struct BenchPrefillProfileArgs {
 }
 
 #[derive(Args, Debug)]
+pub struct BenchFastPrefillArgs {
+    #[arg(long)]
+    pub model: Option<String>,
+    #[arg(long, default_value = "hi")]
+    pub prompt: String,
+    #[arg(long)]
+    pub prompt_file: Option<PathBuf>,
+    #[arg(long, default_value_t = 1900)]
+    pub prompt_repeat: usize,
+    /// Comma-separated cache-only prefill chunk sizes to test.
+    #[arg(long, default_value = "128,256,512,1024,2048,4096")]
+    pub chunk_sizes: String,
+    #[arg(long, default_value_t = 1)]
+    pub iterations: u32,
+    #[arg(long, default_value_t = 0)]
+    pub warmup: u32,
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Args, Debug)]
 pub struct BenchMtpArgs {
     #[arg(long)]
     pub model: Option<String>,
@@ -265,6 +288,7 @@ pub fn run(cli: Cli) -> Result<()> {
         Command::BenchDecode(args) => bench_decode(args),
         Command::BenchInfer(args) => bench_infer(args),
         Command::BenchPrefillProfile(args) => bench_prefill_profile(args),
+        Command::BenchFastPrefill(args) => bench_fast_prefill(args),
         Command::BenchMtp(args) => bench_mtp(args),
         Command::BenchQmv4(args) => bench_qmv4(args),
         Command::BenchContext(args) => bench_context(args),
@@ -606,6 +630,67 @@ fn bench_prefill_profile(args: BenchPrefillProfileArgs) -> Result<()> {
     Ok(())
 }
 
+fn bench_fast_prefill(args: BenchFastPrefillArgs) -> Result<()> {
+    let model_ref = args.model.unwrap_or_else(|| DEFAULT_MODEL.to_string());
+    let mut prompt = prompt_from_args(Some(args.prompt), args.prompt_file)?;
+    if args.prompt_repeat > 1 {
+        prompt = std::iter::repeat_n(prompt, args.prompt_repeat)
+            .collect::<Vec<_>>()
+            .join("\n");
+    }
+    let chunk_sizes = parse_chunk_sizes(&args.chunk_sizes)?;
+    let result = crate::bench::run_fast_prefill_bench(
+        &model_ref,
+        &prompt,
+        &chunk_sizes,
+        args.iterations,
+        args.warmup,
+    )?;
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&result)?);
+    } else {
+        println!("model: {}", result.model);
+        println!("prompt tokens: {}", result.prompt_tokens);
+        println!(
+            "iterations: {} (+{} warmup)",
+            result.iterations, result.warmup
+        );
+        for case in result.cases {
+            let peak_gib = case
+                .mlx_peak_bytes
+                .map(|bytes| bytes as f64 / 1024.0 / 1024.0 / 1024.0);
+            println!(
+                "chunk {:>5}: {:>3} chunks, prefill {:.3}s ({:.1} tok/s), peak {}",
+                case.chunk_tokens,
+                case.chunks,
+                case.avg_prefill_s,
+                case.prefill_tokens_per_s,
+                peak_gib
+                    .map(|value| format!("{value:.2} GiB"))
+                    .unwrap_or_else(|| "unknown".to_string())
+            );
+        }
+    }
+    Ok(())
+}
+
+fn parse_chunk_sizes(value: &str) -> Result<Vec<usize>> {
+    let mut sizes = Vec::new();
+    for part in value.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        let size = part
+            .parse::<usize>()
+            .with_context(|| format!("invalid chunk size {part:?}"))?;
+        anyhow::ensure!(size > 0, "chunk size must be positive");
+        sizes.push(size);
+    }
+    anyhow::ensure!(!sizes.is_empty(), "at least one chunk size is required");
+    Ok(sizes)
+}
+
 fn bench_mtp(args: BenchMtpArgs) -> Result<()> {
     let model_ref = args.model.unwrap_or_else(|| DEFAULT_MODEL.to_string());
     let prompt = prompt_from_args(Some(args.prompt), args.prompt_file)?;
@@ -766,5 +851,29 @@ impl Default for ServeArgs {
             interactive: false,
             dry_run: false,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_chunk_sizes, parse_contexts};
+
+    #[test]
+    fn parse_chunk_sizes_accepts_comma_separated_values() {
+        assert_eq!(
+            parse_chunk_sizes("128, 512,1024").unwrap(),
+            vec![128, 512, 1024]
+        );
+    }
+
+    #[test]
+    fn parse_chunk_sizes_rejects_empty_or_zero_values() {
+        assert!(parse_chunk_sizes("").is_err());
+        assert!(parse_chunk_sizes("128,0").is_err());
+    }
+
+    #[test]
+    fn parse_contexts_still_accepts_comma_separated_values() {
+        assert_eq!(parse_contexts("8192, 16384").unwrap(), vec![8192, 16384]);
     }
 }

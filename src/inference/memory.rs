@@ -12,7 +12,8 @@ use anyhow::Result;
 use super::{InferenceRequest, env_flag, ferrite_env_var};
 
 const DEFAULT_MLX_CACHE_LIMIT_BYTES: usize = 512 * 1024 * 1024;
-const DEFAULT_MLX_MEMORY_LIMIT_BYTES: usize = 8 * 1024 * 1024 * 1024;
+const DEFAULT_MLX_MEMORY_LIMIT_FLOOR_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+const DEFAULT_MLX_WIRED_LIMIT_FLOOR_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const DEFAULT_RSS_KILL_PERCENT: u64 = 50;
 const DEFAULT_MLX_ACTIVE_KILL_PERCENT: u64 = 80;
 
@@ -95,10 +96,11 @@ pub(super) fn memory_trace_enabled() -> bool {
 fn configure_mlx_memory_once() {
     static CONFIGURE: Once = Once::new();
     CONFIGURE.call_once(|| {
+        let total_ram = physical_memory_bytes();
         let memory_limit = ferrite_env_var("MTPLX_MLX_MEMORY_LIMIT_BYTES")
             .ok()
             .and_then(|value| value.trim().parse::<usize>().ok())
-            .unwrap_or(DEFAULT_MLX_MEMORY_LIMIT_BYTES);
+            .unwrap_or_else(|| default_mlx_memory_limit(total_ram));
         if memory_limit > 0 {
             let mut previous = 0_usize;
             let status = unsafe { mlx_sys::mlx_set_memory_limit(&mut previous, memory_limit) };
@@ -109,6 +111,28 @@ fn configure_mlx_memory_once() {
             } else if memory_trace_enabled() {
                 let line = format!(
                     "ferrite_memory phase=configure_mlx_memory_limit limit_bytes={memory_limit} previous_bytes={previous}"
+                );
+                let _ = append_memory_log_line(&line);
+                if env_flag("MTPLX_MEMORY_TRACE_STDERR", false) {
+                    eprintln!("{line}");
+                }
+            }
+        }
+
+        let wired_limit = ferrite_env_var("MTPLX_MLX_WIRED_LIMIT_BYTES")
+            .ok()
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .unwrap_or_else(|| default_mlx_wired_limit(total_ram, memory_limit));
+        if wired_limit > 0 {
+            let mut previous = 0_usize;
+            let status = unsafe { mlx_sys::mlx_set_wired_limit(&mut previous, wired_limit) };
+            if status != 0 {
+                let _ = append_memory_log_line(
+                    "ferrite_memory phase=configure_mlx_wired_limit status=error",
+                );
+            } else if memory_trace_enabled() {
+                let line = format!(
+                    "ferrite_memory phase=configure_mlx_wired_limit limit_bytes={wired_limit} previous_bytes={previous}"
                 );
                 let _ = append_memory_log_line(&line);
                 if env_flag("MTPLX_MEMORY_TRACE_STDERR", false) {
@@ -141,8 +165,36 @@ fn configure_mlx_memory_once() {
     });
 }
 
+fn default_mlx_memory_limit(total_ram: Option<u64>) -> usize {
+    let Some(total) = total_ram else {
+        return DEFAULT_MLX_MEMORY_LIMIT_FLOOR_BYTES as usize;
+    };
+    let three_quarters = (total as u128 * 3 / 4) as u64;
+    let target = three_quarters.max(DEFAULT_MLX_MEMORY_LIMIT_FLOOR_BYTES);
+    usize::try_from(target.min(total)).unwrap_or(usize::MAX)
+}
+
+fn default_mlx_wired_limit(total_ram: Option<u64>, memory_limit: usize) -> usize {
+    let Some(total) = total_ram else {
+        return DEFAULT_MLX_WIRED_LIMIT_FLOOR_BYTES as usize;
+    };
+    let three_fifths = (total as u128 * 3 / 5) as u64;
+    let target = three_fifths.max(DEFAULT_MLX_WIRED_LIMIT_FLOOR_BYTES);
+    let target = usize::try_from(target).unwrap_or(usize::MAX);
+    target.min(memory_limit)
+}
+
 pub(super) fn clear_mlx_cache() {
-    let _ = unsafe { mlx_sys::mlx_clear_cache() };
+    unsafe {
+        let dev = mlx_sys::mlx_device_new_type(mlx_sys::mlx_device_type__MLX_GPU, 0);
+        let mut stream = mlx_sys::mlx_stream_new();
+        if mlx_sys::mlx_get_default_stream(&mut stream, dev) == 0 {
+            let _ = mlx_sys::mlx_synchronize(stream);
+        }
+        let _ = mlx_sys::mlx_stream_free(stream);
+        let _ = mlx_sys::mlx_device_free(dev);
+        let _ = mlx_sys::mlx_clear_cache();
+    }
     mlx_rs::transforms::compile::clear_cache();
 }
 

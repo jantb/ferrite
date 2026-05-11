@@ -92,6 +92,24 @@ pub struct PrefillProfileBenchResult {
 }
 
 #[derive(Clone, Debug, Serialize)]
+pub struct FastPrefillBenchResult {
+    pub model: String,
+    pub prompt_tokens: usize,
+    pub iterations: u32,
+    pub warmup: u32,
+    pub cases: Vec<FastPrefillBenchCase>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct FastPrefillBenchCase {
+    pub chunk_tokens: usize,
+    pub chunks: usize,
+    pub avg_prefill_s: f64,
+    pub prefill_tokens_per_s: f64,
+    pub mlx_peak_bytes: Option<usize>,
+}
+
+#[derive(Clone, Debug, Serialize)]
 pub struct MtpBenchResult {
     pub model: String,
     pub prompt_tokens: usize,
@@ -735,6 +753,149 @@ pub fn run_prefill_profile_bench(
         mlp_down_pct: mlp_down_s / avg_total_s.max(f64::EPSILON) * 100.0,
         layer_glue_pct: layer_glue_s / avg_total_s.max(f64::EPSILON) * 100.0,
     })
+}
+
+#[cfg(feature = "native-mlx")]
+pub fn run_fast_prefill_bench(
+    model_ref: &str,
+    prompt: &str,
+    chunk_sizes: &[usize],
+    iterations: u32,
+    warmup: u32,
+) -> Result<FastPrefillBenchResult> {
+    anyhow::ensure!(
+        !chunk_sizes.is_empty(),
+        "at least one chunk size is required"
+    );
+    let model = crate::model::LoadedModel::load(model_ref)?;
+    let request = crate::inference::InferenceRequest {
+        model: model_ref.to_string(),
+        prompt: prompt.to_string(),
+        system: None,
+        messages: Vec::new(),
+        stop: Vec::new(),
+        max_tokens: Some(1),
+        temperature: 0.0,
+        top_p: 1.0,
+        top_k: 1,
+        depth: 0,
+        mtp: false,
+        requested_context_tokens: None,
+        profile_timings: false,
+    };
+    let prompt_ids = model.encode_prompt(&request)?;
+    anyhow::ensure!(!prompt_ids.is_empty(), "prompt produced no tokens");
+
+    let weights = crate::mlx_backend::MlxWeightStore::load_model_dir(&model.path, &model.tensors)?;
+    let qwen = crate::qwen36::Qwen36Weights::from_loaded(&model, &weights)?;
+    let plan = crate::qwen36::Qwen36Plan::from_model(&model)?;
+
+    let passes = iterations.max(1);
+    let mut cases = Vec::with_capacity(chunk_sizes.len());
+    for &chunk_tokens in chunk_sizes {
+        anyhow::ensure!(chunk_tokens > 0, "chunk size must be positive");
+        for _ in 0..warmup {
+            let _ = run_fast_prefill_once(&qwen, &plan, &prompt_ids, chunk_tokens)?;
+        }
+
+        reset_mlx_peak_memory();
+        let mut total_s = 0.0_f64;
+        let mut chunks = 0_usize;
+        for _ in 0..passes {
+            let started = Instant::now();
+            chunks = run_fast_prefill_once(&qwen, &plan, &prompt_ids, chunk_tokens)?;
+            total_s += started.elapsed().as_secs_f64();
+        }
+        let avg_prefill_s = total_s / f64::from(passes);
+        cases.push(FastPrefillBenchCase {
+            chunk_tokens,
+            chunks,
+            avg_prefill_s,
+            prefill_tokens_per_s: prompt_ids.len() as f64 / avg_prefill_s.max(f64::EPSILON),
+            mlx_peak_bytes: mlx_memory_value(mlx_sys::mlx_get_peak_memory),
+        });
+        clear_mlx_cache_for_bench();
+    }
+
+    Ok(FastPrefillBenchResult {
+        model: model_ref.to_string(),
+        prompt_tokens: prompt_ids.len(),
+        iterations: passes,
+        warmup,
+        cases,
+    })
+}
+
+#[cfg(feature = "native-mlx")]
+fn run_fast_prefill_once(
+    qwen: &crate::qwen36::Qwen36Weights,
+    plan: &crate::qwen36::Qwen36Plan,
+    prompt_ids: &[u32],
+    chunk_tokens: usize,
+) -> Result<usize> {
+    let mut state = qwen.new_decode_state(plan)?;
+    let body_len = prompt_ids.len().saturating_sub(1);
+    let body = &prompt_ids[..body_len];
+    let body_chunks = body.len().div_ceil(chunk_tokens);
+    for chunk in body.chunks(chunk_tokens) {
+        qwen.decode_tokens_cache_only(chunk, plan, &mut state)?;
+        state.clear_transient_block_states();
+        eval_decode_state_for_bench(&state)?;
+        clear_mlx_cache_for_bench();
+    }
+
+    let final_chunk = &prompt_ids[body_len..];
+    let last_hidden = qwen.decode_tokens_last_hidden(final_chunk, plan, &mut state)?;
+    state.clear_transient_block_states();
+    let last_logits = qwen.logits_from_hidden(&last_hidden)?;
+    last_hidden.eval()?;
+    last_logits.eval()?;
+    eval_decode_state_for_bench(&state)?;
+    clear_mlx_cache_for_bench();
+    Ok(body_chunks + 1)
+}
+
+#[cfg(feature = "native-mlx")]
+fn eval_decode_state_for_bench(state: &crate::qwen36::DecodeState) -> Result<()> {
+    for layer in &state.layers {
+        match layer {
+            crate::qwen36::LayerDecodeState::Full(cache) => {
+                if let Some(array) = &cache.k {
+                    array.eval()?;
+                }
+                if let Some(array) = &cache.v {
+                    array.eval()?;
+                }
+            }
+            crate::qwen36::LayerDecodeState::Linear(cache) => {
+                if let Some(array) = &cache.metal_conv_state {
+                    array.eval()?;
+                }
+                if let Some(array) = &cache.metal_recurrent_state {
+                    array.eval()?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "native-mlx")]
+fn clear_mlx_cache_for_bench() {
+    let _ = unsafe { mlx_sys::mlx_clear_cache() };
+    mlx_rs::transforms::compile::clear_cache();
+}
+
+#[cfg(feature = "native-mlx")]
+fn reset_mlx_peak_memory() {
+    let _ = unsafe { mlx_sys::mlx_reset_peak_memory() };
+}
+
+#[cfg(feature = "native-mlx")]
+fn mlx_memory_value(call: unsafe extern "C" fn(*mut usize) -> i32) -> Option<usize> {
+    let mut value = 0_usize;
+    let status = unsafe { call(&mut value as *mut usize) };
+    (status == 0).then_some(value)
 }
 
 #[cfg(feature = "native-mlx")]

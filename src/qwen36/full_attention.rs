@@ -1,11 +1,8 @@
 use std::sync::OnceLock;
 
 use anyhow::{Result, bail};
-use mlx_rs::ops::concatenate_axis;
-use mlx_rs::ops::indexing::IndexOp;
 
 use super::FullAttentionCache;
-use super::masks::decode_block_causal_mask;
 
 #[derive(Debug)]
 pub struct FullAttentionWeights {
@@ -313,16 +310,14 @@ impl FullAttentionWeights {
             let blocks = cache.active_block_slices(blockwise_full_attention_block_tokens())?;
             blockwise_decode_scaled_dot_product_attention(&q, &blocks, tokens, prev_len, scale)?
         } else {
-            let (active_k, active_v, prev_len) = cache.append_and_fetch(k, projected.v)?;
-            let total_keys = active_k.shape()[2];
-            if let Some(chunk) = split_full_attention_chunk_tokens(tokens, prev_len) {
-                split_decode_scaled_dot_product_attention(
-                    &q, &active_k, &active_v, tokens, prev_len, chunk, scale,
-                )?
-            } else {
-                let mask = decode_block_causal_mask(tokens, total_keys, prev_len, q.dtype())?;
-                mlx_rs::fast::scaled_dot_product_attention(&q, &active_k, &active_v, scale, &mask)?
-            }
+            let (active_k, active_v, _) = cache.append_and_fetch(k, projected.v)?;
+            mlx_rs::fast::scaled_dot_product_attention(
+                &q,
+                &active_k,
+                &active_v,
+                scale,
+                mlx_rs::fast::ScaledDotProductAttentionMask::Causal,
+            )?
         };
         let merged = attended.transpose_axes(&[0, 2, 1, 3])?.reshape(&[
             batch,
@@ -367,36 +362,6 @@ fn blockwise_full_attention_config() -> BlockwiseFullAttentionConfig {
             .and_then(|value| value.trim().parse::<i32>().ok())
             .filter(|value| *value > 0)
             .unwrap_or(512),
-    })
-}
-
-fn split_full_attention_chunk_tokens(tokens: i32, prev_len: i32) -> Option<i32> {
-    let config = split_full_attention_config();
-    (config.enabled && prev_len >= config.threshold && tokens > config.chunk)
-        .then_some(config.chunk)
-}
-
-#[derive(Clone, Copy)]
-struct SplitFullAttentionConfig {
-    enabled: bool,
-    threshold: i32,
-    chunk: i32,
-}
-
-fn split_full_attention_config() -> SplitFullAttentionConfig {
-    static VALUE: OnceLock<SplitFullAttentionConfig> = OnceLock::new();
-    *VALUE.get_or_init(|| SplitFullAttentionConfig {
-        enabled: env_flag("FERRITE_SPLIT_FULL_ATTN", true),
-        threshold: std::env::var("FERRITE_SPLIT_FULL_ATTN_THRESHOLD")
-            .ok()
-            .and_then(|value| value.trim().parse::<i32>().ok())
-            .filter(|value| *value >= 0)
-            .unwrap_or(1024),
-        chunk: std::env::var("FERRITE_SPLIT_FULL_ATTN_CHUNK_TOKENS")
-            .ok()
-            .and_then(|value| value.trim().parse::<i32>().ok())
-            .filter(|value| *value > 0)
-            .unwrap_or(128),
     })
 }
 
@@ -531,32 +496,6 @@ fn causal_position_mask(
         }
     }
     Ok(mlx_rs::Array::from_slice(&values, &[1, 1, tokens, block_len]).as_dtype(dtype)?)
-}
-
-fn split_decode_scaled_dot_product_attention(
-    q: &mlx_rs::Array,
-    k: &mlx_rs::Array,
-    v: &mlx_rs::Array,
-    tokens: i32,
-    prev_len: i32,
-    chunk: i32,
-    scale: f32,
-) -> Result<mlx_rs::Array> {
-    let mut outputs = Vec::new();
-    let mut start = 0;
-    while start < tokens {
-        let end = (start + chunk).min(tokens);
-        let key_end = (prev_len + end).min(k.shape()[2]);
-        let q_chunk = q.index((.., .., start..end, ..));
-        let k_chunk = k.index((.., .., 0..key_end, ..));
-        let v_chunk = v.index((.., .., 0..key_end, ..));
-        let mask = decode_block_causal_mask(end - start, key_end, prev_len + start, q.dtype())?;
-        outputs.push(mlx_rs::fast::scaled_dot_product_attention(
-            &q_chunk, &k_chunk, &v_chunk, scale, &mask,
-        )?);
-        start = end;
-    }
-    Ok(concatenate_axis(&outputs, 2)?)
 }
 
 fn apply_attention_gate(

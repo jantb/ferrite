@@ -160,8 +160,6 @@ pub struct Qwen36Weights {
 #[cfg(feature = "native-mlx")]
 mod cache;
 #[cfg(feature = "native-mlx")]
-mod masks;
-#[cfg(feature = "native-mlx")]
 pub use cache::{DecodeState, FullAttentionCache, LayerDecodeState, LinearAttentionCache};
 
 #[cfg(feature = "native-mlx")]

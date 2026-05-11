@@ -62,6 +62,30 @@ pub(super) fn prepare_prompt_state(
         if let Some(index) = best_prompt_cache_match_index(session, prompt_ids) {
             let cached = session.prompt_caches.remove(index);
             let cached_prompt_len = cached.prompt_ids.len();
+            let suffix = &prompt_ids[cached_prompt_len..];
+            if !needs_mtp_history && !suffix.is_empty() {
+                session.prompt_caches.push(cached);
+                let (state, logits, hidden, mtp_history_state) =
+                    prepare_prompt_state_chunked(session, request, prompt_ids, needs_mtp_history)?;
+                let prefill_s = started.elapsed().as_secs_f64();
+                maybe_store_prompt_cache(
+                    session,
+                    prompt_ids,
+                    &state,
+                    &logits,
+                    &hidden,
+                    &mtp_history_state,
+                );
+                return Ok(PreparedPrompt {
+                    state,
+                    logits,
+                    hidden,
+                    mtp_history_state,
+                    prefill_s,
+                    prefix_cache_hit: false,
+                    prefix_cache_tokens: 0,
+                });
+            }
             let mut state = cached.state;
             let mut logits = cached.logits;
             let mut hidden = cached.hidden;
@@ -70,7 +94,6 @@ pub(super) fn prepare_prompt_state(
             } else {
                 session.qwen.new_mtp_decode_state().unwrap_or_default()
             };
-            let suffix = &prompt_ids[cached_prompt_len..];
             if !suffix.is_empty() {
                 extend_prompt_state_chunked(
                     session,
@@ -153,7 +176,28 @@ fn prepare_prompt_state_chunked(
         session.qwen.new_mtp_decode_state().unwrap_or_default()
     };
 
-    let chunk_tokens = prefill_chunk_tokens();
+    if !needs_mtp_history {
+        check_kill_switch("prefill_mlx_before")?;
+        let input = prompt_ids.iter().map(|id| *id as i32).collect::<Vec<_>>();
+        let input_ids = mlx_rs::Array::from_slice(&input, &[1, input.len() as i32]);
+        let (logits, hidden, _hidden_sequence) = session
+            .qwen
+            .prefill_decode_state_with_hidden_sequence(&input_ids, &session.plan, &mut state)?;
+        state.clear_transient_block_states();
+        eval_prepared_prompt_state(&state, &logits, &hidden, &mtp_history_state)?;
+
+        if memory_trace_enabled() {
+            log_memory_sample(
+                "infer",
+                "prefill_mlx",
+                &format!("tokens={} position={}", prompt_ids.len(), state.position),
+            );
+        }
+        check_kill_switch("prefill_mlx_after")?;
+        return Ok((state, logits, hidden, mtp_history_state));
+    }
+
+    let chunk_tokens = prefill_chunk_tokens(prompt_ids.len());
     let eval_interval = prefill_eval_interval_chunks();
     let mut consumed_tokens = 0_usize;
     for (chunk_index, chunk) in prompt_ids.chunks(chunk_tokens).enumerate() {
@@ -267,9 +311,73 @@ fn extend_prompt_state_chunked(
     needs_mtp_history: bool,
 ) -> Result<()> {
     let _ = request;
+    if suffix.is_empty() {
+        return Ok(());
+    }
     let eval_interval = prefill_eval_interval_chunks();
     let mut consumed_tokens = 0_usize;
-    for (chunk_index, chunk) in suffix.chunks(prefill_chunk_tokens()).enumerate() {
+    let total_prompt_tokens = state.position.max(0) as usize + suffix.len();
+    let chunk_tokens = prefill_chunk_tokens(total_prompt_tokens);
+    if !needs_mtp_history {
+        let body_len = suffix.len().saturating_sub(1);
+        let body = &suffix[..body_len];
+        for (chunk_index, chunk) in body.chunks(chunk_tokens).enumerate() {
+            check_kill_switch("prefill_suffix_chunk_before")?;
+            session
+                .qwen
+                .decode_tokens_cache_only(chunk, &session.plan, state)?;
+            state.clear_transient_block_states();
+            if should_eval_prefill_chunk(chunk_index, eval_interval) {
+                eval_decode_state(state)?;
+                clear_mlx_cache();
+            }
+
+            if memory_trace_enabled() {
+                log_memory_sample(
+                    "infer",
+                    "prefill_suffix_chunk_cache_only",
+                    &format!(
+                        "chunk_index={chunk_index} chunk_tokens={} position={}",
+                        chunk.len(),
+                        state.position
+                    ),
+                );
+            }
+            check_kill_switch("prefill_suffix_chunk_after")?;
+        }
+
+        let final_chunk = &suffix[body_len..];
+        let last_hidden =
+            session
+                .qwen
+                .decode_tokens_last_hidden(final_chunk, &session.plan, state)?;
+        state.clear_transient_block_states();
+        let last_logits = session.qwen.logits_from_hidden(&last_hidden)?;
+        last_hidden.eval()?;
+        last_logits.eval()?;
+        eval_decode_state(state)?;
+        clear_mlx_cache();
+
+        if memory_trace_enabled() {
+            log_memory_sample(
+                "infer",
+                "prefill_suffix_chunk",
+                &format!(
+                    "chunk_index={} chunk_tokens={} position={}",
+                    body.chunks(chunk_tokens).count(),
+                    final_chunk.len(),
+                    state.position
+                ),
+            );
+        }
+        check_kill_switch("prefill_suffix_chunk_after")?;
+
+        *logits = last_logits;
+        *hidden = last_hidden;
+        return Ok(());
+    }
+
+    for (chunk_index, chunk) in suffix.chunks(chunk_tokens).enumerate() {
         check_kill_switch("prefill_suffix_chunk_before")?;
         let is_last_chunk = consumed_tokens + chunk.len() == suffix.len();
         consumed_tokens += chunk.len();
